@@ -150,18 +150,42 @@ class ITConcat(SingleInputTransformer):
 
     def input_transformation(self, input: list):
         return self.transform_input(input, self.concat)
-
-# MR-84
-class ITConcatRandomSentence(SingleInputTransformer):
+# MR-84    
+class ITConcatRandomSentence_(SingleInputTransformer):
     def __init__(self, transform_indices=[[0]], rand_seed=42):
         super().__init__(transform_indices)
         self.data = RANDOM_SENTENCES
         self.rand = random.Random(rand_seed)
-
-    def concat_random(self, input_val)
     
+    def concat_random(self, input_val: str) -> str:
+        cleaned_input = input_val.rstrip()
+        if not cleaned_input:
+            return input_val
+    # Sample a random sentence from the original data source and remove white space
+        random_datum = self.rand.choice(self.data).strip()
+        
+        # 1. Prevent prompt hijacking: Check for terminal prompt markers (e.g., "\nAnswer:")
+        prompt_markers = ["\nAnswer:", "\nChoices:", "\nQuestion:"]
+        for marker in prompt_markers:
+            if marker in cleaned_input:
+                prefix, suffix = cleaned_input.rsplit(marker, 1)
+                # Ensure the preceding text ends with valid punctuation
+                glue = "" if prefix.rstrip().endswith((".", "!", "?")) else "."
+                # Insert the random sentence before the prompt marker
+                return f"{prefix.rstrip()}{glue} {random_datum}\n{marker.strip()}{suffix}"
+
+        # 2. Prevent run-on sentences: Add a period if the original input lacks closing punctuation
+        has_punctuation = cleaned_input[-1] in {".", "!", "?"}
+        punctuation_glue = "" if has_punctuation else "."
+
+        # Append strictly to the end of the input according to the original definition
+        return f"{cleaned_input}{punctuation_glue} {random_datum}"
+
+    def input_transformation(self, input: list):
+        return self.transform_input(input, self.concat_random)
+
 # original MR-84
-class ITConcatRandomSentence_og(SingleInputTransformer):
+class ITConcatRandomSentence(SingleInputTransformer):
     def __init__(self, transform_indices=[[0]], rand_seed=42):
         super().__init__(transform_indices)
         self.data = RANDOM_SENTENCES
@@ -531,27 +555,8 @@ class ITLeetFormat(CharacterRandomBase):
     def _get_protected_indices(self, raw_text: str) -> Set[int]:
         doc = nlp(raw_text)
         protected_indices: Set[int] = set()
-
-        # 1. Protect all named entities
-        for ent in doc.ents:
-            protected_indices.update(range(ent.start_char, ent.end_char))
-
-        # 2. Protect numbers, symbols, punctuation, and uppercase acronyms
-        for token in doc:
-            if token.pos_ in {"NUM", "SYM", "X"} or token.is_punct:
-                protected_indices.update(range(token.idx, token.idx + len(token.text)))
-            elif token.text.isupper() and len(token.text) > 1:
-                protected_indices.update(range(token.idx, token.idx + len(token.text)))
-
-        # 3. Protect full-term definitions preceding parenthesized acronyms (e.g., "Multiple-choice question answering (MCQA)")
-        for i in range(len(doc) - 3):
-            if doc[i + 1].text == "(" and doc[i + 2].text.isupper() and doc[i + 3].text == ")":
-                curr = i
-                while curr >= 0 and (doc[curr].pos_ in {"NOUN", "PROPN", "ADJ"} or doc[curr].text == "-"):
-                    protected_indices.update(range(doc[curr].idx, doc[curr].idx + len(doc[curr].text)))
-                    curr -= 1
-
-        # 4. Prevent digit collision across spaces (e.g., prevents "room 10" -> "r00m 10")
+       
+        # Prevent digit collision across spaces (e.g., prevents "room 10" -> "r00m 10")
         for i, char in enumerate(raw_text):
             if char.isdigit():
                 # Look backwards past whitespace
@@ -979,7 +984,36 @@ class ITReplaceKeywordCategoryRE(ITReplaceKeywordCategory):
         output = [context_new, category_words[0], category_words[1]]
         return [output]
 
-# 8 - SYNONYM
+# 8 - SYNONYM - OG
+class ITReplaceKeywordSynonym_og(SingleInputTransformer, ReplaceKeyword):
+    def get_replace_examples(self):
+        return [[[
+            "Sam walked to the store to buy an apple.", 
+            "walked -> travelled\nslowly -> unhurriedly\nbuy -> purchase\nstore -> shop"], 
+            "I travelled to the shop to purchase an apple."],
+            [["I wonder why clothes are so expensive.", 
+            "buy -> purachase\nclothes -> garments\nexpensive -> pricy\nwhy -> for what reason\nfull -> complete"], 
+            "I wonder for what reason garments are so pricy."],]
+
+    def get_synonym(self, input):
+        prompt_template = "Context:\n\"{INPUT_0}\"\nMaking sense in this context, give a synonym for \"{INPUT_1}\". If the word has no synonym, simply output the word itself."
+        examples = [
+            [["Sam walked to the store to buy an apple.", "walked"], "travelled"],
+            [["I wonder why clothes are so expensive.", "expensive"], "pricey"],
+        ]
+        new_word = self.run_gpt(input, prompt_template, examples)
+        cleaned_new_word = self.clean_text(new_word)
+        return cleaned_new_word
+    
+    def replace_synonym(self, input):
+        keywords = self.get_keywords(input)
+        synonym_words = [self.get_synonym(self.bind_context_kw(input, keyword)) for keyword in keywords]
+        return self.replace_words(input, keywords, synonym_words)
+
+    def input_transformation(self, input: list):
+        return self.transform_input(input, self.replace_synonym)
+
+# 8 - SYNONYM - prompt_template
 class ITReplaceKeywordSynonym(SingleInputTransformer, ReplaceKeyword):
     def get_replace_examples(self):
         return [[[
@@ -1062,8 +1096,37 @@ class ReplaceKeywordDifferenceRE(ReplaceKeyword):
         keywords_out = [keyword for keyword in keywords_list_cleaned if keyword not in cleaned_inputs] # remove entities if appear in keywords
         return keywords_out
 
+# 10 - ANTONYM -OG
+class ITReplaceKeywordAntonym_og(SingleInputTransformer, ReplaceKeyword):
+    def get_replace_examples(self):
+        return [[[
+            "She walked to the store to buy an apple.", 
+            "walked -> ran\nslowly -> quickly\nbuy -> sell\nstore -> home\nshe -> he"], 
+            "He ran to the home to sell an apple."],
+            [["In 1993, I broke my arm while cleaning my electric car.", 
+            "noisy -> silent\nmy -> your\nfull -> empty\nelectric -> petrol\ncleaning -> dirtying\nbroke -> fixed"], 
+            "In 1993, I fixed your arm while dirtying your petrol car."],]
 
-# 10 - ANTONYM
+    def get_antonym(self, input):
+        # prompt_template = "Context:\n\"{INPUT_0}\"\nMaking sense in this context, give an antonym for \"{INPUT_1}\". If the word has no antonym, simply output the word itself."
+        prompt_template = "You are given a context and a word. Produce an antonym of the word. Make sure the antonym makes sense in the context. If the word has no antonym, simply output the word itself. \n<context>{INPUT_0}</context>\n<word>{INPUT_1}</word>"
+        examples = [
+            [["She walked to the store to buy an apple.", "buy"], "sell"],
+            [["In 1993, I broke my arm while cleaning my electric car.", "electric"], "petrol"],
+        ]
+        new_word = self.run_gpt(input, prompt_template, examples)
+        cleaned_new_word = self.clean_text(new_word)
+        return cleaned_new_word
+    
+    def replace_antonym(self, input):
+        keywords = self.get_keywords(input)
+        antonym_words = [self.get_antonym(self.bind_context_kw(input, keyword)) for keyword in keywords]
+        return self.replace_words(input, keywords, antonym_words)
+
+    def input_transformation(self, input: list):
+        return self.transform_input(input, self.replace_antonym)
+
+# 10 - ANTONYM - prompt_template
 class ITReplaceKeywordAntonym(SingleInputTransformer, ReplaceKeyword):
     def get_replace_examples(self):
         return [[[
@@ -1183,6 +1246,41 @@ class ITRemoveKeyword(SingleInputTransformer, GPTKeywordBase):
     def input_transformation(self, input: list):
         return self.transform_input(input, self.get_and_remove_keywords)
 
+# MR-51
+class ITParaphrasing(SingleInputTransformer):
+    """
+    MR-51: Offline paraphrase transformer using context-preserving WordNet synonym substitution.
+    Guards Named Entities, Proper Nouns, and uppercase acronyms to preserve ground truth.
+    """
+    def __init__(self, transform_indices=[[0]], aug_p=0.2, nlp=None):
+        super().__init__(transform_indices)
+        self.nlp = nlp if nlp else spacy.load("en_core_web_sm")
+        self.aug = naw.SynonymAug(aug_src="wordnet", aug_p=aug_p)
+
+    def paraphrase_transform(self, input_val: str) -> str:
+        if not input_val.strip():
+            return input_val
+
+        doc = self.nlp(input_val.strip())
+        
+        # Protect entities, acronyms, and numbers
+        protected_words = set()
+        for ent in doc.ents:
+            for token in ent:
+                protected_words.add(token.text)
+        for token in doc:
+            if token.like_num or (token.text.isupper() and len(token.text) > 1):
+                protected_words.add(token.text)
+
+        # Configure stopwords so nlpaug skips critical keywords
+        self.aug.stopwords = list(protected_words)
+        
+        augmented = self.aug.augment(input_val)
+        return augmented[0] if isinstance(augmented, list) else augmented
+
+    def input_transformation(self, input: list):
+        return self.transform_input(input, self.paraphrase_transform)
+
 class ITRemoveKeywordSentence(ITRemoveKeyword):
     def remove_keywords_gpt(self, input_val, keywords):
         prompt_template, examples = self.get_gpt_prompt()
@@ -1212,6 +1310,217 @@ class ITRemoveKeywordRE(ReplaceKeywordDifferenceRE, ITRemoveKeyword):
 class ITRemoveKeywordRESentence(ITRemoveKeywordRE, ITRemoveKeywordSentence):
     pass
 
+# MR-136
+class ITPassiveActiveVoice(SingleInputTransformer):
+    """
+    MR-136: Active/Passive Voice alternation without an LLM.
+    Uses SpaCy dependency parsing to deterministically convert active sentences 
+    to passive voice, and vice-versa, preserving semantic equivalence.
+    """
+    def __init__(self, transform_indices=[[0]], nlp=None):
+        super().__init__(transform_indices)
+        self.nlp = nlp if nlp else spacy.load("en_core_web_sm")
+
+    def _convert_passive_to_active(self, doc) -> str:
+        agent_phrase = None
+        subjpass = None
+        root_verb = None
+        auxpass = None
+
+        for token in doc:
+            if token.dep_ == "nsubjpass":
+                subjpass = token
+            elif token.dep_ == "auxpass":
+                auxpass = token
+            elif token.pos_ == "VERB" and token.dep_ == "ROOT":
+                root_verb = token
+            elif token.dep_ == "agent":
+                # Find the object of preposition 'by'
+                for child in token.children:
+                    if child.dep_ == "pobj":
+                        agent_phrase = "".join([w.text_with_ws for w in child.subtree]).strip()
+
+        if agent_phrase and subjpass and root_verb:
+            # Subject subtree
+            subj_text = "".join([w.text_with_ws for w in subjpass.subtree]).strip()
+            
+            # Simple past / active verb resolution
+            active_verb = root_verb.lemma_
+            if auxpass and auxpass.text.lower() in {"was", "were", "had", "been"}:
+                # Basic regular past inflection heuristic fallback
+                active_verb = root_verb.lemma_ + ("d" if root_verb.lemma_.endswith("e") else "ed")
+                if root_verb.text.lower() not in {"discovered", "created", "eaten"}:
+                    active_verb = root_verb.text
+
+            punct = doc[-1].text if doc[-1].is_punct else ""
+            return f"{agent_phrase.capitalize()} {active_verb} {subj_text.lower()}{punct}"
+
+        return doc.text
+
+    def _convert_active_to_passive(self, doc) -> str:
+        subj = None
+        dobj = None
+        root_verb = None
+
+        for token in doc:
+            if token.dep_ == "nsubj":
+                subj = token
+            elif token.dep_ == "dobj":
+                dobj = token
+            elif token.pos_ == "VERB" and token.dep_ == "ROOT":
+                root_verb = token
+
+        if subj and dobj and root_verb:
+            subj_text = "".join([w.text_with_ws for w in subj.subtree]).strip()
+            dobj_text = "".join([w.text_with_ws for w in dobj.subtree]).strip()
+            
+            # Auxiliary verb selection based on tense and number
+            is_past = root_verb.tag_ in {"VBD", "VBN"}
+            is_plural = dobj.tag_ in {"NNS", "NNPS"}
+            
+            if is_past:
+                aux = "were" if is_plural else "was"
+            else:
+                aux = "are" if is_plural else "is"
+
+            # Past participle
+            verb_participle = root_verb.text if root_verb.tag_ == "VBN" else (
+                root_verb.lemma_ + ("d" if root_verb.lemma_.endswith("e") else "ed")
+            )
+            if root_verb.lemma_ == "eat":
+                verb_participle = "eaten"
+
+            punct = doc[-1].text if doc[-1].is_punct else ""
+            return f"{dobj_text.capitalize()} {aux} {verb_participle} by {subj_text.lower()}{punct}"
+
+        return doc.text
+
+    def voice_transform(self, input_val: str) -> str:
+        if not input_val.strip():
+            return input_val
+
+        doc = self.nlp(input_val.strip())
+        is_passive = any(tok.dep_ == "auxpass" or tok.dep_ == "nsubjpass" for tok in doc)
+
+        if is_passive:
+            return self._convert_passive_to_active(doc)
+        return self._convert_active_to_passive(doc)
+
+    def input_transformation(self, input: list):
+        return self.transform_input(input, self.voice_transform)
+
+# MR-149
+class ITSingularPlural(SingleInputTransformer):
+    """
+    MR-149: Singular <-> Plural alternation without an LLM.
+    Uses SpaCy POS and morphology tagging to toggle noun numbers
+    and balance subject-verb agreement while preserving named entities.
+    """
+    def __init__(self, transform_indices=[[0]], nlp=None):
+        super().__init__(transform_indices)
+        self.nlp = nlp if nlp else spacy.load("en_core_web_sm")
+
+    def _inflect_noun(self, token) -> str:
+        """
+        Converts singular noun to plural, and plural noun to singular.
+        """
+        lemma = token.lemma_.lower()
+        word = token.text
+
+        # Plural -> Singular
+        if token.tag_ in {"NNS", "NNPS"}:
+            if word.isupper():
+                return lemma.upper()
+            if word.istitle():
+                return lemma.capitalize()
+            return lemma
+
+        # Singular -> Plural
+        if token.tag_ in {"NN", "NNP"}:
+            # Common irregular plurals
+            irregulars = {
+                "cabbage": "cabbages",
+                "child": "children",
+                "person": "people",
+                "man": "men",
+                "woman": "women",
+                "tooth": "teeth",
+                "foot": "feet",
+                "mouse": "mice",
+                "datum": "data",
+            }
+            if lemma in irregulars:
+                plural = irregulars[lemma]
+            elif word.endswith(("s", "x", "z", "ch", "sh")):
+                plural = word + "es"
+            elif word.endswith("y") and len(word) > 1 and word[-2] not in "aeiouAEIOU":
+                plural = word[:-1] + "ies"
+            else:
+                plural = word + "s"
+
+            if word.isupper():
+                return plural.upper()
+            if word.istitle():
+                return plural.capitalize()
+            return plural
+
+        return word
+
+    def number_transform(self, input_val: str) -> str:
+        if not input_val.strip():
+            return input_val
+
+        doc = self.nlp(input_val.strip())
+        output_tokens = []
+        skip_next = False
+
+        # Gather tokens to avoid mutating Named Entities, Acronyms, or Numbers
+        protected_indices = set()
+        for ent in doc.ents:
+            for idx in range(ent.start, ent.end):
+                protected_indices.add(idx)
+
+        for i, token in enumerate(doc):
+            if skip_next:
+                skip_next = False
+                continue
+
+            # 1. Skip protected tokens (Named Entities, all-caps acronyms > 1 char, numbers)
+            if i in protected_indices or token.like_num or (token.text.isupper() and len(token.text) > 1):
+                output_tokens.append(token.text_with_ws)
+                continue
+
+            # 2. Handle Indefinite Determiners preceding Singular Nouns ("a cabbage" -> "cabbages")
+            if token.lower_ in {"a", "an"} and i + 1 < len(doc) and doc[i + 1].tag_ == "NN":
+                # Drop "a/an" when the following noun becomes plural
+                continue
+
+            # 3. Toggle Noun Number (NN <-> NNS)
+            if token.pos_ == "NOUN" and token.tag_ in {"NN", "NNS"}:
+                new_noun = self._inflect_noun(token)
+                output_tokens.append(new_noun + token.whitespace_)
+                continue
+
+            # 4. Synchronize Auxiliary/Be-Verb agreement
+            lower_txt = token.text.lower()
+            verb_map = {
+                "is": "are", "are": "is",
+                "was": "were", "were": "was",
+                "has": "have", "have": "has"
+            }
+            if lower_txt in verb_map and token.pos_ in {"AUX", "VERB"}:
+                mapped_verb = verb_map[lower_txt]
+                if token.text.istitle():
+                    mapped_verb = mapped_verb.capitalize()
+                output_tokens.append(mapped_verb + token.whitespace_)
+                continue
+
+            output_tokens.append(token.text_with_ws)
+
+        return "".join(output_tokens)
+
+    def input_transformation(self, input: list):
+        return self.transform_input(input, self.number_transform)
 
 # 152 - NEGATE
 class ITNegateSpacy(SingleInputTransformer, ITBase):
@@ -1278,6 +1587,80 @@ class ITNegateSpacy(SingleInputTransformer, ITBase):
 
                 return "".join(tokens)
         return text
+
+import spacy
+
+# MR-155
+class ITTenseChange(SingleInputTransformer):
+    """
+    MR-155: Tense change transformation without an LLM.
+    Uses SpaCy POS tagging and verb morphology to toggle past and present tenses
+    while maintaining Named Entities and acronym integrity.
+    """
+    def __init__(self, transform_indices=[[0]], nlp=None):
+        super().__init__(transform_indices)
+        self.nlp = nlp if nlp else spacy.load("en_core_web_sm")
+
+    def _shift_verb_tense(self, token) -> str:
+        tag = token.tag_
+        lemma = token.lemma_.lower()
+        word = token.text
+
+        # Auxiliary mappings
+        aux_to_past = {"is": "was", "are": "were", "am": "was", "has": "had", "have": "had", "do": "did", "does": "did", "will": "would", "can": "could"}
+        aux_to_pres = {"was": "is", "were": "are", "had": "has", "did": "does", "would": "will", "could": "can"}
+
+        # Irregular lexical verbs
+        irregulars_past = {"eat": "ate", "see": "saw", "go": "went", "take": "took", "find": "found", "make": "made", "get": "got", "know": "knew"}
+        irregulars_pres = {v: k for k, v in irregulars_past.items()}
+
+        # 1. Past -> Present
+        if tag == "VBD":
+            if word.lower() in aux_to_pres:
+                res = aux_to_pres[word.lower()]
+            elif word.lower() in irregulars_pres:
+                res = irregulars_pres[word.lower()]
+            else:
+                res = lemma
+            return res.capitalize() if word.istitle() else res
+
+        # 2. Present -> Past
+        if tag in {"VBP", "VBZ"}:
+            if word.lower() in aux_to_past:
+                res = aux_to_past[word.lower()]
+            elif lemma in irregulars_past:
+                res = irregulars_past[lemma]
+            else:
+                res = lemma + ("d" if lemma.endswith("e") else "ed")
+            return res.capitalize() if word.istitle() else res
+
+        return word
+
+    def tense_transform(self, input_val: str) -> str:
+        if not input_val.strip():
+            return input_val
+
+        doc = self.nlp(input_val.strip())
+        output_tokens = []
+
+        # Avoid modifying verbs inside Named Entities
+        ent_indices = {i for ent in doc.ents for i in range(ent.start, ent.end)}
+
+        for i, token in enumerate(doc):
+            if i in ent_indices or token.text.isupper() and len(token.text) > 1:
+                output_tokens.append(token.text_with_ws)
+                continue
+
+            if token.pos_ in {"VERB", "AUX"} and token.tag_ in {"VBD", "VBP", "VBZ"}:
+                new_verb = self._shift_verb_tense(token)
+                output_tokens.append(new_verb + token.whitespace_)
+            else:
+                output_tokens.append(token.text_with_ws)
+
+        return "".join(output_tokens)
+
+    def input_transformation(self, input: list):
+        return self.transform_input(input, self.tense_transform)
 
 class ITNegate(GPTRunner, SingleInputTransformer, ITBase):
     def get_prompt(self):

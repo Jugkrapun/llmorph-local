@@ -8,34 +8,61 @@
             "func_it": {"class": "relations.func_it.ITNlpaug", "args": ["synonym"]},
             "func_or": {"class": "relations.func_or.OREquivalence"}
         },
-        "51": {
+        "51_og": {
             "func_it": {"class": "relations.func_it.ITGPT", "kwargs": {"$template": "it_prompt:paraphrasing"}},
             "func_or": {"class": "relations.func_or.OREquivalence"}
         },
+
+        "51": {"func_it": {"class": "relations.func_it.ITParaphrasing"},
+            "func_or": {"class": "relations.func_or.OREquivalence"}
+        },
+
         "120": {
             "func_it": {"class": "relations.func_it.ITNlpaug", "args": ["back_translation"]},
             "func_or": {"class": "relations.func_or.OREquivalence"}
         },
-        "127": {
+        "127_og": {
             "func_it": {"class": "relations.func_it.ITGPT", "kwargs": {"$template": "it_prompt:misspell"}},
+            "func_or": {"class": "relations.func_or.OREquivalence"}
+        },
+        "127": {
+            "func_it": {"class": "relations.func_it.ITNlpaug", "args": ["spelling"]},
             "func_or": {"class": "relations.func_or.OREquivalence"}
         },
         "9": {
             "func_it": {"class": "relations.func_it.ITGPT", "kwargs": {"$template": "it_prompt:word_insertion"}},
             "func_or": {"class": "relations.func_or.OREquivalence"}
         },
-        "149": {
+        "149_og": {
             "func_it": {"class": "relations.func_it.ITGPTSentence", "kwargs": {"$template": "it_prompt:singular_plural"}},
             "func_or": {"class": "relations.func_or.OREquivalence"},
             "exceptions": ["inference"]
         },
-        "155": {
+
+        "149": {"func_it": {"class": "relations.func_it.ITSingularPlural"},
+            "func_or": {"class": "relations.func_or.OREquivalence"},
+            "exceptions": ["inference"]
+        },
+
+        "155_og": {
             "func_it": {"class": "relations.func_it.ITGPT", "kwargs": {"$template": "it_prompt:tense_change"}},
             "func_or": {"class": "relations.func_or.OREquivalence"},
             "exceptions": ["sentiment_analysis_continuous"]
         },
-        "136": {
+
+        "155": {"func_it": {"class": "relations.func_it.ITTenseChange"},
+            "func_or": {"class": "relations.func_or.OREquivalence"},
+            "exceptions": ["sentiment_analysis_continuous"]
+        },
+
+        "136_og": {
             "func_it": {"class": "relations.func_it.ITGPT", "kwargs": {"$template": "it_prompt:passive_active"}},
+            "func_or": {"class": "relations.func_or.OREquivalence"},
+            "exceptions": ["sentiment_analysis_continuous"]
+        },
+
+        "136": {
+            "func_it": {"class": "relations.func_it.ITPassiveActiveVoice"},
             "func_or": {"class": "relations.func_or.OREquivalence"},
             "exceptions": ["sentiment_analysis_continuous"]
         },
