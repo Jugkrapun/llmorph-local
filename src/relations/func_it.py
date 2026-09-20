@@ -151,7 +151,7 @@ class ITConcat(SingleInputTransformer):
     def input_transformation(self, input: list):
         return self.transform_input(input, self.concat)
 # MR-84    
-class ITConcatRandomSentence_(SingleInputTransformer):
+class ITConcatRandomSentence_edit(SingleInputTransformer):
     def __init__(self, transform_indices=[[0]], rand_seed=42):
         super().__init__(transform_indices)
         self.data = RANDOM_SENTENCES
@@ -361,7 +361,7 @@ class CharacterRandomBase(ObjectRandomBase):
         return self.join_tokens(new_text)
 
 # MR-1
-class ITReplaceCharacters(CharacterRandomBase):
+class ITReplaceCharacters_edit(CharacterRandomBase):
     # Logical operators, quantifiers, and negations that alter core semantics if mutated
     PROTECTED_WORDS: Set[str] = {
         "not", "no", "never", "none", "neither", "nor", 
@@ -423,14 +423,14 @@ class ITReplaceCharacters(CharacterRandomBase):
         return text
 
 # original MR-1
-class ITReplaceCharacters_og(CharacterRandomBase):
+class ITReplaceCharacters(CharacterRandomBase):
     def object_transform(self, ids: list, text: list):
         for i in ids:
             text[i] = chr(self.rand.randint(97, 122))
         return text
 
 # MR-2
-class ITDeleteCharacters(CharacterRandomBase):
+class ITDeleteCharacters_edit(CharacterRandomBase):
     # Logical operators, quantifiers, and negations that alter core semantics if mutated
     PROTECTED_WORDS: Set[str] = {
         "not", "no", "never", "none", "neither", "nor", 
@@ -446,8 +446,6 @@ class ITDeleteCharacters(CharacterRandomBase):
         # 1. Protect all named entities
         for ent in doc.ents:
             protected_indices.update(range(ent.start_char, ent.end_char))
-
-        # 2. Protect functional tokens, short tokens, numbers, symbols, whitespace, and acronyms
         for token in doc:
             is_proper_noun = token.pos_ == "PROPN" or token.tag_ in {"NNP", "NNPS"}
             is_negation = token.lower_ in self.PROTECTED_WORDS or token.dep_ == "neg"
@@ -490,14 +488,14 @@ class ITDeleteCharacters(CharacterRandomBase):
         return text
 
 # original MR-2
-class ITDeleteCharacters_og(CharacterRandomBase):
+class ITDeleteCharacters(CharacterRandomBase):
     def object_transform(self, ids: list, text: list):
         for i in ids:
             text[i] = ''
         return text
 
 # MR-4
-class ITAddCharacters(CharacterRandomBase):
+class ITAddCharacters_edit(CharacterRandomBase):
     def _get_protected_indices(self, raw_text: str) -> Set[int]:
         doc = nlp(raw_text)
         protected_indices: Set[int] = set()
@@ -535,14 +533,14 @@ class ITAddCharacters(CharacterRandomBase):
         return text
 
 # original MR-4
-class ITAddCharacters_og(CharacterRandomBase):
+class ITAddCharacters(CharacterRandomBase):
     def object_transform(self, ids: list, text: list):
         for i in ids:
             text[i] = text[i] + chr(self.rand.randint(97, 122))
         return text
 
 # MR-3
-class ITLeetFormat(CharacterRandomBase):
+class ITLeetFormat_edit(CharacterRandomBase):
     # Leet mapping table
     LEET_DICT: Dict[str, str] = {
         'a': '4', 'A': '4',
@@ -586,7 +584,7 @@ class ITLeetFormat(CharacterRandomBase):
         return text
 
 # original MR-3
-class ITLeetFormat_og(CharacterRandomBase):
+class ITLeetFormat(CharacterRandomBase):
     def object_transform(self, ids: list, text: list):
         leet_dict = {'a': '4', 'e': '3', 'i': '1', 'o': '0', 't': '7'}
         for i in ids:
@@ -601,7 +599,7 @@ class ITAddSpaces(CharacterRandomBase):
         return text
 
 # MR-6
-class ITSwapCharacters(CharacterRandomBase):
+class ITSwapCharacters_edit(CharacterRandomBase):
     def _get_protected_indices(self, raw_text: str) -> Set[int]:
         doc = nlp(raw_text)
         protected_indices: Set[int] = set()
@@ -651,7 +649,7 @@ class ITSwapCharacters(CharacterRandomBase):
         return text
 
 #  original MR-6
-class ITSwapCharacters_og(CharacterRandomBase):
+class ITSwapCharacters(CharacterRandomBase):
     def object_transform(self, ids: list, text: list):
         for i in ids:
             if i < len(text) - 1:
@@ -672,7 +670,7 @@ class ITRandomiseCharacterOrderInWord(WordRandomBase):
         return text
 
 # MR-7
-class ITRandomiseCharacterOrderInWordKeepingEnds(WordRandomBase):
+class ITRandomiseCharacterOrderInWordKeepingEnds_edit(WordRandomBase):
     # Lexical negation and quantification terms critical to premise truth values
     PROTECTED_WORDS: Set[str] = {
         "not", "no", "never", "none", "neither", "nor",
@@ -757,7 +755,7 @@ class ITRandomiseCharacterOrderInWordKeepingEnds(WordRandomBase):
         return text
 
 # original MR-7
-class ITRandomiseCharacterOrderInWordKeepingEnds_og(WordRandomBase):
+class ITRandomiseCharacterOrderInWordKeepingEnds(WordRandomBase):
     def transform_function(self, text):
         tokens = self.tokenise(text)
         ids_at_least_4 = [i for i, token in enumerate(tokens) if len(token) >= 4]
