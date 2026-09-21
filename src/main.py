@@ -15,7 +15,7 @@ def main():
     parser.add_argument("-r", "--replace-perc", required=False, type=float, metavar="PERCENT", nargs="?", default=0.1, help="The ratio value for generating follow up inputs (range: 0.0 - 1.0, default: 0.1).")
     parser.add_argument("-n", "--num-threads", required=False, type=int, metavar="N", default=1, help="Number of data points to process concurrently (SUT/Hermes calls in flight at once, default: 1).")
     parser.add_argument("--parallel-input-transformation", action="store_true", help="Also run input_transformation (follow-up input generation) fully in parallel across threads, instead of serializing it. Only safe for MRs whose input_transformation only calls an LLM (e.g. ITGPT/ITGPTSentence) -- unsafe for ones using a local model (spaCy, nlpaug, KeyBERT, ...).")
-    parser.add_argument("-t", "--transformation-llm", required=False, type=str, metavar="MODEL", default=None, help="Model to use for Hermes (the transformation LLM), e.g. the name shown in the llama.cpp server UI. Defaults to the same model passed as 'llm' (the SUT) if not given.")
+    parser.add_argument("-T", "--transformation-llm", required=False, type=str, metavar="MODEL", default=None, help="Model to use for Hermes (the transformation LLM), e.g. the name shown in the llama.cpp server UI. Defaults to the same model passed as 'llm' (the SUT) if not given.")
 
 
     args = parser.parse_args()
