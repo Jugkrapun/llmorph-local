@@ -11,6 +11,7 @@ import nlpaug.augmenter.sentence as nas
 import re
 # Custom negation feature
 import spacy
+import pyinflect
 import os
 from openai import OpenAI
 from typing import Set, Dict, List

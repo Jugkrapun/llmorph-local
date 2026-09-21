@@ -3,26 +3,6 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-*.sh
-
-llm
-test_experiment
-
-*.zip
-
-*.txt
-
-*.csv
-.DS_Store
-
-# Ignore data dir
-data
-
-results_from_server
-
-# ignore report pdf from reporter.py
-*.pdf
-
 # C extensions
 *.so
 
@@ -184,3 +164,7 @@ cython_debug/
 .idea
 relations.json
 .python-version
+
+GoogleNews-vectors-negative300.bin
+
+*.bin
