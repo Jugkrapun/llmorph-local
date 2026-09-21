@@ -1,3 +1,4 @@
+import inspect # for checking that class need that params
 import importlib
 from mt_run import run_test
 from relations.mt_mr_main import Relation
@@ -88,23 +89,38 @@ def get_relations_to_run(task_name: str, relation_names: list, relations_list: d
 def run_that_test(llm_name: str, task_name: str, relation_name: str, tasks_list: dict, relations_list: dict, run_config: dict, checkpoint: dict | None) -> None:
     task_config = tasks_list[task_name]
     relation_config = relations_list[task_name][relation_name]
-    relation_test = instantiate_relation_test(llm_name, task_name, relation_name, task_config, relation_config)
+    relation_test = instantiate_relation_test(llm_name, task_name, relation_name, task_config, relation_config, run_config)
     run_relation_test(relation_test, run_config, checkpoint)
 
 
 
 
-def instantiate_relation_test(llm_name, task_name, relation_name, task_config, relation_config) -> Relation:
+def instantiate_relation_test(llm_name, task_name, relation_name, task_config, relation_config, run_config) -> Relation:
     components = {}
     combined_config = {**task_config, **relation_config}
     for key, config in combined_config.items():
-        components[key] = instantiate_class(config["class"], *(config.get("args") or []), **(config.get("kwargs") or {}))
+
+        # Inject into ObjectRandomBase
+        kwargs = dict(config.get("kwargs") or {})
+
+        # Inject replace_perc into func_it only
+        if key == "func_it":
+            kwargs["replace_perc"] = run_config.get("replace_perc", 0.1)
+        # end of the line
+
+        components[key] = instantiate_class(config["class"], *(config.get("args") or []), **kwargs)  # **(config.get("kwargs") or {}))
     return Relation(llm_name, task_name, relation_name, **components)
 
 def instantiate_class(path, *args, **kwargs):
     module_name, class_name = path.rsplit(".", 1)
     module = importlib.import_module(module_name)
     class_ = getattr(module, class_name)
+
+    # Check that class accepting it
+    sig = inspect.signature(class_.__init__)
+    if "replace_perc" not in sig.parameters:
+        kwargs.pop("replace_perc", None)
+
     return class_(*args, **kwargs)
 
 def run_relation_test(test: Relation, run_config: dict, checkpoint: dict | None = None) -> None:

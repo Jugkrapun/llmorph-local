@@ -3,13 +3,15 @@
         "question_answering": ["1", "2"]
     },
     "llm_list": [
-        "gpt-4-1106"
+      "gemma-3-4b-it-q4_k_m"
     ],
 
     "checkpoint_interval": 50,
     "continue_from_checkpoint": true,
 
     "llm_key_file": "security/token-key.jwt",
+
+    "llm_gguf_file": "llm/gemma-3-4b-it-q4_k_m.gguf",
 
     "existing_source_inputs": "data/data-example/source_inputs/source_inputs.json",
 

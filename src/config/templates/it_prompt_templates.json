@@ -21,10 +21,12 @@
         ]
     },
     "antonym_replacement": {
-        "prompt_template": "Replace words in the following with antonyms such that the sentence means something different:\n\"{INPUT_0}\"\nOnly output the changed text, nothing else.",
+        "prompt_template": "Replace eligible words in the following text with antonyms to change its meaning:\\n\"{INPUT_0}\"\\nRules:\\n1. NEVER replace technical terms, proper nouns, model names, or acronyms.\\n2. If a word lacks a clear, logical antonym in context, leave it unchanged. Do not replace words randomly or with generic terms.\\n3. Maintain grammatical correctness and logical structure.\\nOnly output the changed text, nothing else.",
         "examples": [
             [["Is Scott and Sid based on a true story?"], "Is Scott and Sid based on a false story?"],
-            [["I fell asleep at 6pm."], "I woke up at 6pm."]
+            [["I fell asleep at 6pm."], "I woke up at 6pm."],
+            [["Most existing MCQA datasets are small in size, which increases the difficulty of model learning."], "Most existing MCQA datasets are large in size, which decreases the difficulty of model learning."],
+            [["The proposed MMT framework is independent of backbone language models."], "The proposed MMT framework is dependent on backbone language models."]
         ]
     },
     "paraphrasing": {
@@ -222,5 +224,5 @@
             [["", "She thinks cats are super cute and lovely."], "She likes cats."]
         ],
         "multi_input": true
-    }
+    }   
 }

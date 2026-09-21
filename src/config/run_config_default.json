@@ -10,11 +10,20 @@
     "checkpoint_interval": -1,
     "continue_from_checkpoint": false,
 
+    "num_threads": 1,
+    "parallel_input_transformation": false,
+
     "llm_key_file": "security/token-key.jwt",
     "llm_wait_time": 10,
     "llm_max_retries": -1,
-    "llm_endpoint": "https://api.openai.com/v1",
-    "llm_for_transformation": null,
+    "llm_endpoint": "http://localhost:8089/v1",
+    "llm_for_transformation": "Nous-Hermes-2-Mixtral-8x7B-DPO.Q2_K",
+
+    "redis_host": "localhost",
+    "redis_port": 6379,
+    "redis_db": 0,
+    "hermes_queue_name": "llmorph:hermes:requests",
+    "hermes_response_timeout": 300,
 
     "only_generate_followup_inputs": false,
     "only_generate_source": false,

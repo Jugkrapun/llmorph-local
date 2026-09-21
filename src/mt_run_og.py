@@ -1,23 +1,7 @@
 from file_handler import save_json, load_json, get_timestamp, file_exists
 from relations.func_base import FuncDB, FuncIT, FuncOR, FuncSUT, FuncVerify
-from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 import os
-
-def parallel_map_ordered(fn, items, num_threads):
-    """
-    Applies fn to items, optionally spreading the calls (SUT/Hermes requests)
-    across a thread pool while yielding results in input order -- so callers
-    can still index results positionally for checkpointing regardless of
-    num_threads. num_threads <= 1 runs strictly sequentially.
-    """
-    if not num_threads or num_threads <= 1:
-        for item in items:
-            yield fn(item)
-        return
-
-    with ThreadPoolExecutor(max_workers=num_threads) as executor:
-        yield from executor.map(fn, items)
 
 def run_test(llm_name : str, task_name : str, relation_name : str, get_dataset : FuncDB, input_transformation : FuncIT, run_sut : FuncSUT, output_relation : FuncOR, run_config : dict, checkpoint : dict | None = None, verify_source_input : FuncVerify = None, verify_source_output : FuncVerify = None, verify_followup_input : FuncVerify = None):
     # print("Running test...")
@@ -95,42 +79,33 @@ def get_save_source_input_data(get_dataset: FuncDB, task_name: str, run_config: 
     return get_dataset()
 
 
-def get_save_verify(data: list, to_verify: list[bool], verify_func: FuncVerify, verification_name: str, uid: str, verification_dir: str, num_threads: int = 1):
+def get_save_verify(data: list, to_verify: list[bool], verify_func: FuncVerify, verification_name: str, uid: str, verification_dir: str):
     # caching verification
     if verify_func is None:
         return None
-
+    
     filename = os.path.join(verification_dir, f"{verification_name}__{uid}.json")
     if not file_exists(filename):
         print(f"Cached verification not found. Doing {verification_name}...")
-        verify_list = do_verify(data, to_verify, verify_func, num_threads)
+        verify_list = do_verify(data, to_verify, verify_func)
         save_json(verify_list, filename)
         return verify_list
     print(f"Cached verification found at {filename}")
     return load_json(filename)
 
-def do_verify(data: list, to_verify: list[bool], verify_func: FuncVerify, num_threads: int = 1):
-    def run_one(item):
-        d, do_verif = item
-        return verify_func(d) if do_verif else None
-
-    items = list(zip(data, to_verify))
-    results = parallel_map_ordered(run_one, items, num_threads)
-    return list(tqdm(results, total=len(items)))
+def do_verify(data: list, to_verify: list[bool], verify_func: FuncVerify):
+    return [verify_func(d) if do_verif else None for d, do_verif in tqdm(zip(data, to_verify), total=len(data))]
 
 def get_save_vsi(source_inputs: list, verify_source_input: FuncVerify, task_name: str, relation_name: str, run_config: dict):
     source_inputs = [i[0] for i in source_inputs]
     to_verify = [True] * len(source_inputs)
-    num_threads = run_config.get("num_threads") or 1
-    return get_save_verify(source_inputs, to_verify, verify_source_input, "verify_source_input", f"{task_name}__{relation_name}", run_config["dir_vsi"], num_threads)
+    return get_save_verify(source_inputs, to_verify, verify_source_input, "verify_source_input", f"{task_name}__{relation_name}", run_config["dir_vsi"])
 
 def get_save_vso(source_outputs: list, source_input_verification: list[bool|None], verify_source_output: FuncVerify, task_name: str, relation_name: str, run_config: dict):
-    num_threads = run_config.get("num_threads") or 1
-    return get_save_verify(source_outputs, source_input_verification, verify_source_output, "verify_source_output", f"{task_name}__{relation_name}", run_config["dir_vso"], num_threads)
+    return get_save_verify(source_outputs, source_input_verification, verify_source_output, "verify_source_output", f"{task_name}__{relation_name}", run_config["dir_vso"])
 
 def get_save_vfi(followup_inputs: list, source_input_verification: list[bool|None],  verify_followup_input: FuncVerify, task_name: str, relation_name: str, run_config: dict):
-    num_threads = run_config.get("num_threads") or 1
-    return get_save_verify(followup_inputs, source_input_verification, verify_followup_input, "verify_followup_input", f"{task_name}__{relation_name}", run_config["dir_vfi"], num_threads)
+    return get_save_verify(followup_inputs, source_input_verification, verify_followup_input, "verify_followup_input", f"{task_name}__{relation_name}", run_config["dir_vfi"])
 
 
 
@@ -153,24 +128,16 @@ def run_and_save_source_outputs(dataset, run_sut : FuncSUT, filename : str, llm_
     if checkpoint and checkpoint["checkpoint_type"] != "source_outputs": checkpoint = None
     outputs = [] if not checkpoint else checkpoint["data"]
     checkpoint_interval = run_config["checkpoint_interval"]
-    num_threads = run_config.get("num_threads") or 1
 
-    start_index = checkpoint["next_id"] if checkpoint else 0
-    remaining_indices = list(range(start_index, len(dataset)))
-
-    def run_one(i):
-        data = dataset[i]
+    for i, data in tqdm(enumerate(dataset), total=len(dataset), desc=f"Generating source outputs for ({llm_name}, {task_name})"):
+        if checkpoint and i < checkpoint["next_id"]: # start from checkpoint
+            continue
         if not isinstance(data, list):
             data = [data]
-        return run_sut(data)
-
-    results = parallel_map_ordered(run_one, remaining_indices, num_threads)
-    for offset, output in tqdm(enumerate(results), total=len(remaining_indices), desc=f"Generating source outputs for ({llm_name}, {task_name})"):
-        i = remaining_indices[offset]
-        outputs.append(output)
+        outputs.append(run_sut(data))
         if checkpoint_interval and checkpoint_interval > 0 and i % checkpoint_interval == checkpoint_interval - 1:
             save_checkpoint(outputs, checkpoint_type="source_outputs", next_id=i+1, llm_name=llm_name, task_name=task_name, relation_name="", run_config=run_config)
-
+    
     print(f"Source outputs cached to {filename}")
     save_json(outputs, filename)
 
@@ -192,30 +159,23 @@ def run_and_save_followup_inputs(dataset, input_transformation : FuncIT, source_
     if checkpoint and checkpoint["checkpoint_type"] != "followup_inputs": checkpoint = None
     inputs = [] if not checkpoint else checkpoint["data"]
     checkpoint_interval = run_config["checkpoint_interval"]
-    # only parallelize when explicitly opted in: some MRs' input_transformation
-    # uses a local model (spaCy/nlpaug/KeyBERT/...) that isn't thread-safe.
-    num_threads = (run_config.get("num_threads") or 1) if run_config.get("parallel_input_transformation") else 1
 
-    start_index = checkpoint["next_id"] if checkpoint else 0
-    remaining_indices = list(range(start_index, len(dataset)))
-
-    def run_one(i):
-        data = dataset[i]
+    for i, data in tqdm(enumerate(dataset), total=len(dataset), desc=f"Generating follow-up inputs for ({task_name}, {relation_name})"):
+        if checkpoint and i < checkpoint["next_id"]: # start from checkpoint
+            continue
         if not isinstance(data, list):
             data = [data]
+
         # verify source input
         if source_input_verification and not source_input_verification[i]:
-            return None
-        return input_transformation(data)
-
-    results = parallel_map_ordered(run_one, remaining_indices, num_threads)
-    for offset, followup_inputs in tqdm(enumerate(results), total=len(remaining_indices), desc=f"Generating follow-up inputs for ({task_name}, {relation_name})"):
-        i = remaining_indices[offset]
+            followup_inputs = None
+        else:
+            followup_inputs = input_transformation(data)
         inputs.append(followup_inputs)
 
         if checkpoint_interval and checkpoint_interval > 0 and i % checkpoint_interval == checkpoint_interval - 1:
             save_checkpoint(inputs, checkpoint_type="followup_inputs", next_id=i+1, llm_name="", task_name=task_name, relation_name=relation_name, run_config=run_config)
-
+    
     print(f"Follow-up inputs cached to {filename}")
     save_json(inputs, filename)
 
@@ -229,9 +189,8 @@ def process_dataset(dataset,
     
     if checkpoint and checkpoint["checkpoint_type"] != "followup_outputs": checkpoint = None
     data_list = [] if not checkpoint else checkpoint["data"]
-
+    
     checkpoint_interval = run_config["checkpoint_interval"]
-    num_threads = run_config.get("num_threads") or 1
 
     source_output_cache = check_and_initialize_cache(dataset, source_output_cache, "source outputs")
     followup_input_cache = check_and_initialize_cache(dataset, followup_input_cache, "follow-up inputs")
@@ -241,31 +200,27 @@ def process_dataset(dataset,
 
     total_length = min(len(dataset), len(source_output_cache), len(followup_input_cache))
 
-    do_limit = run_config["data_start_index"] is not None and run_config["data_end_index"] is not None and run_config["data_start_index"] >= 0 and run_config["data_end_index"] >= 0
-    start_index = run_config["data_start_index"] if do_limit else 0
+    for i, (source_input, source_output, followup_input) in tqdm(enumerate(zip(dataset, source_output_cache, followup_input_cache)), total=total_length, desc=f"Running test for ({llm_name}, {task_name}, {relation_name})"):
+        if checkpoint and i < checkpoint["next_id"]: # start from checkpoint
+            continue
 
-    start_i = checkpoint["next_id"] if checkpoint else 0
-    remaining_indices = list(range(start_i, total_length))
-
-    def run_one(i):
-        return process_single_input(
-            dataset[i],
-            input_transformation,
-            run_sut,
-            output_relation,
-            source_input_verification_cache[i],
-            source_output_verification_cache[i],
-            followup_input_verification_cache[i],
-            source_output=source_output_cache[i],
-            followup_inputs=followup_input_cache[i],
+        do_limit = run_config["data_start_index"] is not None and run_config["data_end_index"] is not None and run_config["data_start_index"] >= 0 and run_config["data_end_index"] >= 0
+        start_index = run_config["data_start_index"] if do_limit else 0
+        
+        data = process_single_input(
+            source_input, 
+            input_transformation, 
+            run_sut, 
+            output_relation, 
+            source_input_verification_cache[i], 
+            source_output_verification_cache[i], 
+            followup_input_verification_cache[i], 
+            source_output=source_output, 
+            followup_inputs=followup_input,
             id=start_index + i
         )
-
-    results = parallel_map_ordered(run_one, remaining_indices, num_threads)
-    for offset, data in tqdm(enumerate(results), total=len(remaining_indices), desc=f"Running test for ({llm_name}, {task_name}, {relation_name})"):
-        i = remaining_indices[offset]
         data_list.append(data)
-
+        
         if checkpoint_interval and checkpoint_interval > 0 and i % checkpoint_interval == checkpoint_interval - 1:
             save_checkpoint(data_list, checkpoint_type="followup_outputs", next_id=i+1, llm_name=llm_name, task_name=task_name, relation_name=relation_name, run_config=run_config)
 
