@@ -813,9 +813,195 @@ class ITReplaceSentences(SentenceRandomBase):
             text[i] = dummy_sentence
         return text
 
+# shared spaCy model for the dependency-parse-based transforms below (MR-136, MR-149)
+_SPACY_NLP = None
+def get_spacy_nlp():
+    global _SPACY_NLP
+    if _SPACY_NLP is None:
+        _SPACY_NLP = spacy.load("en_core_web_sm")
+    return _SPACY_NLP
+
+# MR-136 augmenter (used via ITNlpaug, augment_type='passive_active')
+class PassiveActiveAugmenter:
+    _PRONOUN_SUBJ_TO_OBJ = {"i": "me", "he": "him", "she": "her", "we": "us", "they": "them", "who": "whom"}
+    _PRONOUN_OBJ_TO_SUBJ = {v: k for k, v in _PRONOUN_SUBJ_TO_OBJ.items()}
+
+    def __init__(self):
+        self.nlp = get_spacy_nlp()
+
+    def augment(self, text):
+        doc = self.nlp(text)
+        return ' '.join(self._convert_sentence(sent) for sent in doc.sents)
+
+    def _convert_sentence(self, sent):
+        root = next((tok for tok in sent if tok.dep_ == "ROOT" and tok.pos_ in ("VERB", "AUX")), None)
+        if root is None:
+            return sent.text
+        return self._active_to_passive(sent, root) or self._passive_to_active(sent, root) or sent.text
+
+    def _is_plural(self, token):
+        return token.tag_ in ("NNS", "NNPS")
+
+    def _recase(self, span, capitalize_first):
+        tokens = list(span)
+        if len(tokens) == 1 and tokens[0].pos_ == "PRON":
+            word = tokens[0].text.lower()
+            text = self._PRONOUN_SUBJ_TO_OBJ.get(word) or self._PRONOUN_OBJ_TO_SUBJ.get(word) or tokens[0].text
+        else:
+            text = span.text
+            if tokens[0].pos_ != "PROPN" and text:
+                text = text[0].lower() + text[1:]
+        if capitalize_first and text:
+            text = text[0].upper() + text[1:]
+        return text
+
+    def _be_form(self, tag, plural):
+        forms = pyinflect.getInflection("be", tag)
+        if not forms:
+            return None
+        return forms[1] if (plural and len(forms) > 1) else forms[0]
+
+    def _end_punct(self, sent):
+        return sent[-1].text if sent[-1].pos_ == "PUNCT" else "."
+
+    # e.g. "Alex discovered penicillin." -> "Penicillin was discovered by Alex."
+    def _active_to_passive(self, sent, root):
+        if root.tag_ not in ("VBD", "VBZ", "VBP"):
+            return None
+        subj = next((c for c in root.children if c.dep_ == "nsubj"), None)
+        dobj = next((c for c in root.children if c.dep_ == "dobj"), None)
+        if subj is None or dobj is None:
+            return None
+        if any(c.dep_ in ("aux", "auxpass", "neg") for c in root.children):
+            return None  # skip modals/negation/already-passive constructs we don't model
+
+        participle = pyinflect.getInflection(root.lemma_, "VBN")
+        aux = self._be_form(root.tag_, self._is_plural(dobj))
+        if not participle or aux is None:
+            return None
+
+        subj_span = sent.doc[subj.left_edge.i: subj.right_edge.i + 1]
+        dobj_span = sent.doc[dobj.left_edge.i: dobj.right_edge.i + 1]
+        new_subject = self._recase(dobj_span, capitalize_first=True)
+        new_object = self._recase(subj_span, capitalize_first=False)
+        return f"{new_subject} {aux} {participle[0]} by {new_object}{self._end_punct(sent)}"
+
+    # e.g. "Penicillin was discovered by Alex." -> "Alex discovered penicillin."
+    def _passive_to_active(self, sent, root):
+        if root.tag_ != "VBN":
+            return None
+        nsubjpass = next((c for c in root.children if c.dep_ == "nsubjpass"), None)
+        auxpass = next((c for c in root.children if c.dep_ == "auxpass"), None)
+        agent_prep = next((c for c in root.children if c.dep_ == "agent"), None)
+        if nsubjpass is None or auxpass is None or agent_prep is None:
+            return None
+        pobj = next((c for c in agent_prep.children if c.dep_ == "pobj"), None)
+        if pobj is None or any(c.dep_ in ("aux", "neg") for c in root.children):
+            return None
+
+        if auxpass.tag_ == "VBD":
+            verb_tag = "VBD"
+        elif auxpass.text.lower() == "am" or auxpass.tag_ == "VBP":
+            verb_tag = "VBP"
+        else:
+            verb_tag = "VBP" if self._is_plural(pobj) else "VBZ"
+
+        verb_form = pyinflect.getInflection(root.lemma_, verb_tag)
+        if not verb_form:
+            return None
+
+        nsubjpass_span = sent.doc[nsubjpass.left_edge.i: nsubjpass.right_edge.i + 1]
+        pobj_span = sent.doc[pobj.left_edge.i: pobj.right_edge.i + 1]
+        new_subject = self._recase(pobj_span, capitalize_first=True)
+        new_object = self._recase(nsubjpass_span, capitalize_first=False)
+        return f"{new_subject} {verb_form[0]} {new_object}{self._end_punct(sent)}"
+
+
+# MR-149
+class ITSingularPlural(SingleInputTransformer):
+    def singular_plural(self, text):
+        nlp = get_spacy_nlp()
+        doc = nlp(text)
+        return ' '.join(self._convert_sentence(sent) for sent in doc.sents)
+
+    def _convert_sentence(self, sent):
+        replacements = {}  # token.i -> replacement text, or None to drop the token
+        insertions = {}    # token.i -> text to insert before this token
+        verb_targets = {}  # governing verb token.i -> new subject number ('singular'/'plural')
+
+        for tok in sent:
+            if tok.pos_ != "NOUN" or tok.tag_ not in ("NN", "NNS"):
+                continue
+            if any(c.dep_ == "nummod" for c in tok.children):
+                continue  # skip numeral-modified nouns (e.g. "three boats") - can't singularise sensibly
+
+            is_plural = tok.tag_ == "NNS"
+            forms = pyinflect.getInflection(tok.lemma_, "NN" if is_plural else "NNS")
+            if not forms:
+                continue
+            replacements[tok.i] = forms[0]
+
+            # match by tag rather than dep_=='det' since the parser sometimes mislabels
+            # determiners on unusual sentences (e.g. temporal "this")
+            det = next((c for c in tok.children if c.tag_ == "DT"), None)
+            if is_plural:
+                # plural -> singular: fix demonstratives, or add an indefinite article if bare
+                if det is not None:
+                    dtext = det.text.lower()
+                    if dtext == "these":
+                        replacements[det.i] = "this"
+                    elif dtext == "those":
+                        replacements[det.i] = "that"
+                else:
+                    insertions[tok.i] = "an" if forms[0][0].lower() in "aeiou" else "a"
+            else:
+                # singular -> plural: drop the indefinite article, fix demonstratives
+                if det is not None:
+                    dtext = det.text.lower()
+                    if dtext in ("a", "an"):
+                        replacements[det.i] = None
+                    elif dtext == "this":
+                        replacements[det.i] = "these"
+                    elif dtext == "that":
+                        replacements[det.i] = "those"
+
+            if tok.dep_ in ("nsubj", "nsubjpass"):
+                verb_targets[tok.head.i] = "singular" if is_plural else "plural"
+
+        # keep the governing verb (and any 'be' aux/copula) agreeing with the new subject number
+        for verb_i, new_number in verb_targets.items():
+            verb = sent.doc[verb_i]
+            for vt in [verb] + [c for c in verb.children if c.dep_ in ("aux", "auxpass")]:
+                if vt.lemma_ == "be" or vt.tag_ in ("VBZ", "VBP"):
+                    forms = pyinflect.getInflection(vt.lemma_, "VBZ" if new_number == "singular" else "VBP")
+                    if forms:
+                        replacements[vt.i] = forms[0]
+
+        out = []
+        for tok in sent:
+            insertion = insertions.get(tok.i)
+            if insertion is not None:
+                out.append(insertion)
+                out.append(' ')
+            if tok.i in replacements:
+                new_text = replacements[tok.i]
+                if new_text is None:
+                    continue  # dropped (e.g. removed "a"/"an"); also drops its trailing whitespace
+                out.append(new_text)
+            else:
+                out.append(tok.text)
+            out.append(tok.whitespace_)
+
+        result = ''.join(out).strip()
+        return result[0].upper() + result[1:] if result else result
+
+    def input_transformation(self, input: list):
+        return self.transform_input(input, self.singular_plural)
+
+
 
 # NLPAUG
-# MR 126 (keyboard), 127 (spelling), 128 (ocr), 120 (back_translation)
+# MR 126 (keyboard), 127 (spelling), 128 (ocr), 120 (back_translation), 136 (passive_active)
 
 nlpaug_kwargs = {
     'keyboard': {
@@ -838,6 +1024,7 @@ nlpaug_kwargs = {
         'aug_src': 'wordnet',
     },
     'back_translation': {},
+    'passive_active': {},
 }
 
 initialised_augmenter_map = {
@@ -849,6 +1036,7 @@ initialised_augmenter_map = {
     'spelling': naw.SpellingAug(**nlpaug_kwargs['spelling']),
     'synonym': naw.SynonymAug(**nlpaug_kwargs['synonym']),
     'back_translation': naw.BackTranslationAug(**nlpaug_kwargs['back_translation']),
+    'passive_active': PassiveActiveAugmenter(**nlpaug_kwargs['passive_active']),
 }
 
 class ITNlpaug(SingleInputTransformer):
@@ -872,6 +1060,7 @@ class ITNlpaug(SingleInputTransformer):
             # 'tfidf': naw.TfIdfAug,
             # 'word_embs': naw.WordEmbsAug,
             'back_translation': naw.BackTranslationAug,
+            'passive_active': PassiveActiveAugmenter,
             # 'reserved': naw.ReservedAug,
             # 'contextual_word_embs_sentence': nas.ContextualWordEmbsForSentenceAug,
             # 'abst_summ': nas.AbstSummAug,
