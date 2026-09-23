@@ -17,7 +17,7 @@
     "llm_wait_time": 10,
     "llm_max_retries": -1,
     "llm_endpoint": "http://localhost:8089/v1",
-    "llm_for_transformation": "Nous-Hermes-2-Mixtral-8x7B-DPO.Q2_K",
+    "llm_for_transformation": "gemma-3-4b-it-q4_k_m",
 
     "redis_host": "localhost",
     "redis_port": 6379,
