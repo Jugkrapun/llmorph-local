@@ -5,10 +5,6 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
-# Headless backend to prevent display errors
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import spacy
 
 
@@ -91,7 +87,6 @@ class NgramExtractor:
             span1 = " ".join(ngrams1[pos_idx]).strip()
             span2 = " ".join(ngrams2[pos_idx]).strip()
 
-            # Record only transformed spans where original and followup differ
             if span1 and span2 and span1 != span2:
                 pairs.append((pos_idx, span1, span2))
 
@@ -212,11 +207,9 @@ class DatasetEvaluator:
                 mapping = self.extractor.extract_anchor_aligned_ngrams(tokens_src, tokens_fol, gram_level)
                 method_used = "Anchor Alignment"
 
-            # Check cosine similarity for each transformed mapping element
             for pos_idx, word_orig, word_trans in mapping:
                 cosine_score = self.scorer.check_cosine(word_orig, word_trans, mode)
 
-                # Validate against threshold
                 is_valid = (cosine_score >= threshold) if mode == "Synonym" else (cosine_score <= threshold)
 
                 if is_valid:
@@ -233,7 +226,6 @@ class DatasetEvaluator:
                     "pass_threshold": is_valid,
                 })
 
-        # Precision = (passed transformations) / (total transformed elements)
         precision = (passed_threshold_count / total_map_elements) if total_map_elements > 0 else 0.0
 
         return {
@@ -246,7 +238,7 @@ class DatasetEvaluator:
 
 
 class ResultExporter:
-    """Exports results to sequential CSV and visual summary plot."""
+    """Exports results to sequential CSV and formatted text log files."""
 
     @staticmethod
     def export_csv(
@@ -288,60 +280,44 @@ class ResultExporter:
         print(f"[Saved] CSV saved to: '{csv_path}'")
 
     @staticmethod
-    def save_summary_plot(
+    def save_summary_log(
         summary_res: dict,
         mode: str,
         gram_level: int,
+        threshold: float,
         llm_name: str,
         task_name: str,
         relation_name: str,
         output_dir: str,
         date_str: str,
     ) -> None:
-        """Renders and saves a summary table figure."""
-        headers = ["Metric Description", "Value"]
-        table_data = [
-            ["Model Evaluated", llm_name],
-            ["Relation ID", str(relation_name)],
-            ["Evaluation Level", f"{gram_level}-Gram"],
-            ["Method", "Static Vector Check"],
-            ["Total Evaluated Shots", f"{summary_res['total_shots']:,}"],
-            ["Total Changed N-Grams (|map|)", f"{summary_res['total_map']:,}"],
-            ["Passed Threshold N-Grams", f"{summary_res['passed_threshold']:,}"],
-            ["Computed Precision", f"{summary_res['precision'] * 100:.2f}%"],
+        """Saves evaluation summary directly to a structured text log file."""
+        log_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{gram_level}gram_summary.txt"
+        log_path = os.path.join(output_dir, log_filename)
+
+        lines = [
+            "=" * 60,
+            f"          EVALUATION SUMMARY LOG ({gram_level}-GRAM)",
+            "=" * 60,
+            f"Timestamp:                 {date_str}",
+            f"Model Evaluated:           {llm_name}",
+            f"Task Name:                 {task_name}",
+            f"Relation ID:               {relation_name}",
+            f"Evaluation Mode:           {mode}",
+            f"Similarity Threshold:      {threshold}",
+            f"Method:                    Static Vector Check (spaCy)",
+            "-" * 60,
+            f"Total Evaluated Shots:     {summary_res['total_shots']:,}",
+            f"Total Changed (|map|):     {summary_res['total_map']:,}",
+            f"Passed Threshold:          {summary_res['passed_threshold']:,}",
+            f"Computed Precision:        {summary_res['precision'] * 100:.2f}%",
+            "=" * 60,
         ]
 
-        fig, ax = plt.subplots(figsize=(9.2, 4.2))
-        ax.axis("off")
+        with open(log_path, mode="w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
 
-        plt.title(
-            f"Evaluation Summary ({summary_res['total_shots']} Shots)\n"
-            f"Task: {task_name} | Mode: {mode} | Level: {gram_level}-Gram",
-            fontsize=12,
-            fontweight="bold",
-            pad=12,
-        )
-
-        table = ax.table(
-            cellText=table_data, colLabels=headers, cellLoc="center", loc="center"
-        )
-        table.auto_set_font_size(False)
-        table.set_fontsize(10)
-        table.scale(1.2, 1.8)
-
-        for (row, col), cell in table.get_celld().items():
-            if row == 0:
-                cell.set_facecolor("#2B4C7E")
-                cell.set_text_props(color="white", fontweight="bold")
-            else:
-                cell.set_facecolor("#F8F9FA" if row % 2 == 0 else "#FFFFFF")
-
-        plot_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{gram_level}gram_summary.png"
-        plot_path = os.path.join(output_dir, plot_filename)
-
-        plt.savefig(plot_path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-        print(f"[Saved] Summary image saved to: '{plot_path}'")
+        print(f"[Saved] Summary log saved to: '{log_path}'")
 
 
 class EvaluationPipeline:
@@ -410,7 +386,7 @@ class EvaluationPipeline:
             print(f"Precision:                {results['precision'] * 100:.2f}%")
             print("========================================================================")
 
-            output_dir = os.path.join("plots", mode.capitalize(), f"plot-{gram_level}gram")
+            output_dir = os.path.join("logs", mode.capitalize(), f"log-{gram_level}gram")
             os.makedirs(output_dir, exist_ok=True)
 
             if results["metrics"]:
@@ -418,8 +394,8 @@ class EvaluationPipeline:
                     results["metrics"], mode, output_dir, llm_name, relation_name, gram_level, date_str
                 )
 
-            self.exporter.save_summary_plot(
-                results, mode, gram_level, llm_name, task_name, relation_name, output_dir, date_str
+            self.exporter.save_summary_log(
+                results, mode, gram_level, threshold, llm_name, task_name, relation_name, output_dir, date_str
             )
 
 
