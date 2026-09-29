@@ -5,23 +5,22 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
-# Headless backend to prevent X11 display pixmap overflow errors
+# Headless backend to prevent display errors
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import spacy
-from sentence_transformers import SentenceTransformer, util
 
 
 class Tokenizer:
     """Wraps spaCy for tokenization and per-shot token-length scanning."""
 
     def __init__(self, spacy_model: str = "en_core_web_md"):
-        # Load spaCy pipeline strictly for tokenization
+        # Disable heavy neural pipeline components for fast rule-based processing
         self.nlp = spacy.load(spacy_model, disable=["parser", "ner", "tagger"])
 
     def tokenize(self, text: str) -> List[str]:
-        """Tokenizes text using spaCy, stripping standalone punctuation and whitespace."""
+        """Tokenizes text, converting to lowercase and stripping standalone punctuation/whitespace."""
         doc = self.nlp(text)
         return [
             token.text.lower()
@@ -31,7 +30,7 @@ class Tokenizer:
 
     @staticmethod
     def _extract_texts(item: dict) -> Tuple[str, Optional[str]]:
-        """Pulls (source_text, followup_text) out of one dataset entry."""
+        """Extracts source and followup texts from a dataset entry."""
         src_input = item.get("source_input", [])
         src_text = " ".join(src_input) if isinstance(src_input, list) else str(src_input)
 
@@ -44,7 +43,7 @@ class Tokenizer:
         return src_text, fol_text
 
     def scan_token_lengths(self, data_entries: List[dict]) -> Dict[int, bool]:
-        """Scans dataset to determine equal length vs mismatched shots."""
+        """Scans dataset to route shots to standard sliding or anchor alignment based on token lengths."""
         equality_map: Dict[int, bool] = {}
         mismatched_count = 0
 
@@ -63,26 +62,22 @@ class Tokenizer:
             else:
                 equality_map[shot_id] = False
                 mismatched_count += 1
-                print(
-                    f"  - Shot #{shot_id}: Mismatch (Source: {len_src} tokens | "
-                    f"Followup: {len_fol} tokens | Diff: {len_fol - len_src:+d}) "
-                    f"-> routed to Anchor Alignment"
-                )
 
         print(
-            f"\n[Scan Summary] Equal length shots: {len(data_entries) - mismatched_count} "
+            f"[Scan Summary] Equal length shots: {len(data_entries) - mismatched_count} "
             f"| Mismatched shots: {mismatched_count}"
         )
         return equality_map
 
 
 class NgramExtractor:
-    """Builds position-aligned n-gram pairs from two token sequences."""
+    """Extracts position-aligned n-gram pairs for changed tokens."""
 
     @staticmethod
     def extract_standard_sliding_ngrams(
         tokens1: List[str], tokens2: List[str], n: int
     ) -> List[Tuple[int, str, str]]:
+        """Builds standard positional sliding window pairs for equal-length token lists."""
         pairs = []
         if n == 1:
             ngrams1 = [[t] for t in tokens1]
@@ -96,6 +91,7 @@ class NgramExtractor:
             span1 = " ".join(ngrams1[pos_idx]).strip()
             span2 = " ".join(ngrams2[pos_idx]).strip()
 
+            # Record only transformed spans where original and followup differ
             if span1 and span2 and span1 != span2:
                 pairs.append((pos_idx, span1, span2))
 
@@ -103,6 +99,7 @@ class NgramExtractor:
 
     @staticmethod
     def _build_alignment_map(tokens1: List[str], tokens2: List[str]) -> List[int]:
+        """Maps tokens1 indices to corresponding tokens2 indices using SequenceMatcher opcodes."""
         matcher = SequenceMatcher(None, tokens1, tokens2)
         map_j: List[Optional[int]] = [None] * len(tokens1)
 
@@ -127,6 +124,7 @@ class NgramExtractor:
     def extract_anchor_aligned_ngrams(
         self, tokens1: List[str], tokens2: List[str], n: int
     ) -> List[Tuple[int, str, str]]:
+        """Builds anchor-aligned n-gram pairs for mismatched sequence lengths to prevent index shift."""
         if not tokens1:
             return []
 
@@ -157,61 +155,26 @@ class NgramExtractor:
 
 
 class SimilarityScorer:
-    """
-    Computes Token-wise Cosine Similarity using SentenceTransformer exclusively
-    across all N-Gram levels.
-    """
+    """Computes cosine similarity for word pairs using static word vectors."""
 
-    def __init__(self, sentence_model_name: str = "all-mpnet-base-v2"):
-        self.model = SentenceTransformer(sentence_model_name)
+    def __init__(self, nlp):
+        self.nlp = nlp
 
-    def _get_single_word_similarity(self, w1: str, w2: str) -> float:
-        """Computes similarity between two single words using SentenceTransformer embeddings."""
-        if w1 == w2:
-            return 1.0
+    def check_cosine(self, word_orig: str, word_trans: str, mode: str) -> float:
+        """Calculates vector cosine similarity, adjusting polarity for antonyms."""
+        doc1 = self.nlp(word_orig)
+        doc2 = self.nlp(word_trans)
 
-        emb1 = self.model.encode(w1, convert_to_tensor=True)
-        emb2 = self.model.encode(w2, convert_to_tensor=True)
-        return float(util.cos_sim(emb1, emb2).item())
+        if doc1.has_vector and doc2.has_vector and doc1.vector_norm and doc2.vector_norm:
+            cosine = float(doc1.similarity(doc2))
+        else:
+            cosine = 0.0
 
-    def calculate_token_averaged_similarity(
-        self, orig_text: str, mod_text: str, gram_level: int, mode: str
-    ) -> float:
-        """
-        Calculates similarity per token position with SentenceTransformer,
-        then computes the average score (e.g., divided by 2 for 2-gram, by 3 for 3-gram).
-        """
-        words1 = orig_text.split()
-        words2 = mod_text.split()
-
-        # For 1-Gram (Direct single word)
-        if gram_level == 1:
-            raw_score = self._get_single_word_similarity(orig_text, mod_text)
-            return -raw_score if mode == "Antonym" else raw_score
-
-        # For 2-Gram, 3-Gram, etc.
-        token_scores = []
-        max_tokens = max(len(words1), len(words2), gram_level)
-
-        for i in range(max_tokens):
-            w1 = words1[i] if i < len(words1) else ""
-            w2 = words2[i] if i < len(words2) else ""
-
-            if w1 and w2:
-                sim = self._get_single_word_similarity(w1, w2)
-            else:
-                sim = 0.0
-
-            token_scores.append(sim)
-
-        # Average across N-gram elements: (sim1 + sim2 + ... + simN) / N
-        avg_score = sum(token_scores) / len(token_scores) if token_scores else 0.0
-
-        return -avg_score if mode == "Antonym" else avg_score
+        return -cosine if mode == "Antonym" else cosine
 
 
 class DatasetEvaluator:
-    """Runs extraction + scoring across an entire dataset for one gram level."""
+    """Evaluates transformation precision across dataset shots for a specific n-gram level."""
 
     def __init__(self, tokenizer: Tokenizer, extractor: NgramExtractor, scorer: SimilarityScorer):
         self.tokenizer = tokenizer
@@ -226,11 +189,11 @@ class DatasetEvaluator:
         mode: str,
         threshold: float = 0.8,
     ) -> Dict[str, Any]:
-        all_pairs_collected = []
-        total_passed = 0
-        total_transformations = 0
+        all_map_records = []
+        total_map_elements = 0
+        passed_threshold_count = 0
 
-        print(f"\nProcessing {len(data_entries)} shots ({gram_level}-Gram Token-wise Average)...")
+        print(f"\nProcessing {len(data_entries)} shots ({gram_level}-Gram)...")
 
         for shot_idx, item in enumerate(data_entries):
             shot_id = item.get("id", shot_idx)
@@ -243,46 +206,47 @@ class DatasetEvaluator:
 
             is_equal = equality_map.get(shot_id, True)
             if is_equal:
-                pairs = self.extractor.extract_standard_sliding_ngrams(tokens_src, tokens_fol, gram_level)
+                mapping = self.extractor.extract_standard_sliding_ngrams(tokens_src, tokens_fol, gram_level)
                 method_used = "Standard Sliding"
             else:
-                pairs = self.extractor.extract_anchor_aligned_ngrams(tokens_src, tokens_fol, gram_level)
+                mapping = self.extractor.extract_anchor_aligned_ngrams(tokens_src, tokens_fol, gram_level)
                 method_used = "Anchor Alignment"
 
-            for pos_idx, orig_text, mod_text in pairs:
-                sim_score = self.scorer.calculate_token_averaged_similarity(
-                    orig_text, mod_text, gram_level, mode
-                )
+            # Check cosine similarity for each transformed mapping element
+            for pos_idx, word_orig, word_trans in mapping:
+                cosine_score = self.scorer.check_cosine(word_orig, word_trans, mode)
 
-                is_valid = (sim_score >= threshold) if mode == "Synonym" else (sim_score <= threshold)
+                # Validate against threshold
+                is_valid = (cosine_score >= threshold) if mode == "Synonym" else (cosine_score <= threshold)
 
                 if is_valid:
-                    total_passed += 1
-                total_transformations += 1
+                    passed_threshold_count += 1
+                total_map_elements += 1
 
-                all_pairs_collected.append({
+                all_map_records.append({
                     "shot_id": shot_id,
                     "word_pos": pos_idx,
                     "method": method_used,
-                    "original": orig_text,
-                    "transformed": mod_text,
-                    "cosine_similarity": round(sim_score, 4),
+                    "original": word_orig,
+                    "transformed": word_trans,
+                    "cosine_similarity": round(cosine_score, 4),
                     "pass_threshold": is_valid,
                 })
 
-        micro_precision = (total_passed / total_transformations) if total_transformations > 0 else 0.0
+        # Precision = (passed transformations) / (total transformed elements)
+        precision = (passed_threshold_count / total_map_elements) if total_map_elements > 0 else 0.0
 
         return {
             "total_shots": len(data_entries),
-            "total_transformations": total_transformations,
-            "total_passed": total_passed,
-            "micro_precision": micro_precision,
-            "metrics": all_pairs_collected,
+            "total_map": total_map_elements,
+            "passed_threshold": passed_threshold_count,
+            "precision": precision,
+            "metrics": all_map_records,
         }
 
 
 class ResultExporter:
-    """Writes evaluation results to CSV and a summary plot image."""
+    """Exports results to sequential CSV and visual summary plot."""
 
     @staticmethod
     def export_csv(
@@ -294,6 +258,7 @@ class ResultExporter:
         gram_level: int,
         date_time_str: str,
     ) -> None:
+        """Saves metric details to a formatted CSV file."""
         metric_list.sort(key=lambda x: (int(x["shot_id"]), int(x["word_pos"])))
 
         csv_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_time_str}_{gram_level}gram_sequential.csv"
@@ -320,7 +285,7 @@ class ResultExporter:
                     f"{item['cosine_similarity']:.4f}",
                 ])
 
-        print(f"[Saved] Evaluation CSV correctly formatted and saved to: '{csv_path}'")
+        print(f"[Saved] CSV saved to: '{csv_path}'")
 
     @staticmethod
     def save_summary_plot(
@@ -333,23 +298,24 @@ class ResultExporter:
         output_dir: str,
         date_str: str,
     ) -> None:
+        """Renders and saves a summary table figure."""
         headers = ["Metric Description", "Value"]
         table_data = [
             ["Model Evaluated", llm_name],
             ["Relation ID", str(relation_name)],
             ["Evaluation Level", f"{gram_level}-Gram"],
-            ["Cosine Engine", "SentenceTransformer (all-mpnet-base-v2)"],
+            ["Method", "Static Vector Check"],
             ["Total Evaluated Shots", f"{summary_res['total_shots']:,}"],
-            ["Total Evaluated N-Grams", f"{summary_res['total_transformations']:,}"],
-            ["Passed Transformations", f"{summary_res['total_passed']:,}"],
-            ["Overall Dataset Precision", f"{summary_res['micro_precision'] * 100:.2f}%"],
+            ["Total Changed N-Grams (|map|)", f"{summary_res['total_map']:,}"],
+            ["Passed Threshold N-Grams", f"{summary_res['passed_threshold']:,}"],
+            ["Computed Precision", f"{summary_res['precision'] * 100:.2f}%"],
         ]
 
         fig, ax = plt.subplots(figsize=(9.2, 4.2))
         ax.axis("off")
 
         plt.title(
-            f"Embedding Evaluation Summary ({summary_res['total_shots']} Shots)\n"
+            f"Evaluation Summary ({summary_res['total_shots']} Shots)\n"
             f"Task: {task_name} | Mode: {mode} | Level: {gram_level}-Gram",
             fontsize=12,
             fontweight="bold",
@@ -379,16 +345,12 @@ class ResultExporter:
 
 
 class EvaluationPipeline:
-    """Orchestrates the full CLI flow."""
+    """Orchestrates the entire evaluation workflow."""
 
-    def __init__(
-        self,
-        spacy_model: str = "en_core_web_md",
-        sentence_model_name: str = "all-mpnet-base-v2",
-    ):
+    def __init__(self, spacy_model: str = "en_core_web_md"):
         self.tokenizer = Tokenizer(spacy_model)
         self.extractor = NgramExtractor()
-        self.scorer = SimilarityScorer(sentence_model_name)
+        self.scorer = SimilarityScorer(self.tokenizer.nlp)
         self.evaluator = DatasetEvaluator(self.tokenizer, self.extractor, self.scorer)
         self.exporter = ResultExporter()
 
@@ -438,16 +400,15 @@ class EvaluationPipeline:
         for gram_level in gram_levels:
             results = self.evaluator.evaluate(data_entries, equality_map, gram_level, mode, threshold)
 
-            print(f"\n================ DATASET EVALUATION RESULTS ({gram_level}-GRAM) ================")
-            print(f"Model:                 {llm_name}")
-            print(f"Task:                  {task_name} (Relation {relation_name})")
-            print(f"Cosine Engine:         SentenceTransformer (all-mpnet-base-v2)")
-            print(f"Threshold:             {threshold}")
-            print(f"Total Shots:           {results['total_shots']}")
-            print(f"Total N-grams Found:   {results['total_transformations']}")
-            print(f"Total Passed Criteria: {results['total_passed']}")
-            print(f"Overall Precision:     {results['micro_precision'] * 100:.2f}%")
-            print("============================================================")
+            print(f"\n================ EVALUATION RESULTS ({gram_level}-GRAM) ================")
+            print(f"Model:                    {llm_name}")
+            print(f"Task:                     {task_name} (Relation {relation_name})")
+            print(f"Mode:                     {mode} (Threshold: {threshold})")
+            print(f"Total Shots:              {results['total_shots']}")
+            print(f"Total Changed (|map|):    {results['total_map']}")
+            print(f"Passed Threshold:         {results['passed_threshold']}")
+            print(f"Precision:                {results['precision'] * 100:.2f}%")
+            print("========================================================================")
 
             output_dir = os.path.join("plots", mode.capitalize(), f"plot-{gram_level}gram")
             os.makedirs(output_dir, exist_ok=True)
