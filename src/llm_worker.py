@@ -1,5 +1,5 @@
 """
-Queue receiver for Hermes (the transformation LLM).
+Queue receiver for the transformation LLM.
 
 This is the only part of the system that actually calls the Hermes LLM
 endpoint for transformation requests: LLMorph itself (llm_runner.py) only
@@ -19,6 +19,8 @@ import json
 import signal
 import threading
 import time
+from typing import Callable, Optional
+import redis
 
 from openai import OpenAI
 from requests.exceptions import Timeout
@@ -26,23 +28,32 @@ from requests.exceptions import Timeout
 from config_handler import get_run_config_from_json, store_run_config
 from llm_queue import get_redis_client, get_queue_name, response_key, RESPONSE_KEY_TTL
 
-POLL_TIMEOUT = 5  # seconds between checks of the request queue; lets the worker notice shutdown promptly
+POLL_TIMEOUT = 5  
 
+# Global flag for graceful shutdown
 _shutdown_requested = False
 
+# Known API Error patterns
+AZURE_CONTENT_FILTER_ERRORS = [
+    "Invalid response object from API: '{\"detail\":\"Error code: 400",
+    "The response was filtered due to the prompt triggering Azure OpenAI"
+]
+REPETITIVE_PATTERN_ERRORS = [
+    "Sorry! We've encountered an issue with repetitive patterns in your prompt."
+]
+CONTEXT_SIZE_ERRORS = [
+    "Context size has been exceeded",
+    "context_length_exceeded",
+    "maximum context length"
+]
 
 def _handle_shutdown_signal(signum, frame):
     global _shutdown_requested
     _shutdown_requested = True
 
-
-def build_run_llm(client, wait_time, max_retries):
-    """
-    Ported from llm_runner.get_llm_function: the model now travels with
-    each queued job instead of being bound up front, since one worker can
-    serve requests for any model.
-    """
-    def run_llm(model, messages):
+def build_run_llm(client: OpenAI, wait_time: int, max_retries: int) -> Callable:
+    """Creates an inference function bound to the provided API client."""
+    def run_llm(model: str, messages: list) -> Optional[str]:
         for attempt in range(max_retries):
             try:
                 chat_completion = client.chat.completions.create(
@@ -55,23 +66,22 @@ def build_run_llm(client, wait_time, max_retries):
             except Timeout:
                 print(f"Request timed out. Attempt {attempt + 1} of {max_retries}. Retrying...")
             except Exception as e:
-                try:
-                    # Ignore if the error is a content filtering error
-                    filter_error_msgs = [
-                        "Invalid response object from API: \'{\"detail\":\"Error code: 400 - {\\\'error\\\': {\\\'message\\\': \\\\\"The response was filtered due to the prompt triggering Azure OpenAI\\\'s content management policy. Please modify your prompt and retry. To learn more about our content filtering policies please read our documentation: https://go.microsoft.com/fwlink/?linkid=2198766\\\\\", \\\'type\\\': None, \\\'param\\\': \\\'prompt\\\', \\\'code\\\': \\\'content_filter\\\', \\\'status\\\': 400}}\"}\' (HTTP response code was 500)",
-                        "Error code: 500 - {\'detail\': \'Error code: 400 - {\\\'error\\\': {\\\'message\\\': \"The response was filtered due to the prompt triggering Azure OpenAI\\\'s content management policy. Please modify your prompt and retry. To learn more about our content filtering policies please read our documentation: https://go.microsoft.com/fwlink/?linkid=2198766\", \\\'type\\\': None, \\\'param\\\': \\\'prompt\\\', \\\'code\\\': \\\'content_filter\\\', \\\'status\\\': 400}}\'}",
-                    ]
-                    if e.message in filter_error_msgs or e.user_message in filter_error_msgs or e.code == 'content_filter' or str(e) in filter_error_msgs or "The response was filtered due to the prompt triggering Azure OpenAI" in str(e):
-                        print("Warning: Content filtering error")
-                        return "The response was filtered due to the prompt triggering Azure OpenAI\'s content management policy. Please modify your prompt and retry. To learn more about our content filtering policies please read our documentation: https://go.microsoft.com/fwlink/?linkid=2198766"
-                    rep_error_msgs = [
-                        "An error occurred: Error code: 500 - {\'detail\': \'Error code: 400 - {\\\'error\\\': {\\\'message\\\': \"Sorry! We\\\'ve encountered an issue with repetitive patterns in your prompt. Please try again with a different prompt.\", \\\'type\\\': \\\'invalid_request_error\\\', \\\'param\\\': \\\'prompt\\\', \\\'code\\\': \\\'invalid_prompt\\\'}}\'}"
-                    ]
-                    if e.message in rep_error_msgs or e.user_message in rep_error_msgs or str(e) in rep_error_msgs:
-                        print("Warning: Repetitive patterns error")
-                        return "Sorry! We\'ve encountered an issue with repetitive patterns in your prompt. Please try again with a different prompt."
-                except:
-                    pass
+                error_str = str(e)
+                
+                # Check for Context Size Exceeded (Skip immediately to prevent infinite retry)
+                if any(err.lower() in error_str.lower() for err in CONTEXT_SIZE_ERRORS):
+                    print(f"Warning: Context size exceeded for job. Skipping without retry: {e}")
+                    return "[SKIPPED: Context size has been exceeded]"
+
+                # Check for Azure Content Filtering
+                if any(err in error_str for err in AZURE_CONTENT_FILTER_ERRORS) or getattr(e, 'code', '') == 'content_filter':
+                    print("Warning: Content filtering error")
+                    return "The response was filtered due to the prompt triggering Azure OpenAI's content management policy. Please modify your prompt and retry."
+                
+                # Check for Repetitive Patterns
+                if any(err in error_str for err in REPETITIVE_PATTERN_ERRORS):
+                    print("Warning: Repetitive patterns error")
+                    return "Sorry! We've encountered an issue with repetitive patterns in your prompt. Please try again with a different prompt."
 
                 print(f"An error occurred: {e}")
                 print(f"Attempt {attempt + 1} of {max_retries}. Retrying...")
@@ -82,8 +92,8 @@ def build_run_llm(client, wait_time, max_retries):
 
     return run_llm
 
-
-def process_job(raw_job, run_llm, r):
+def process_job(raw_job: bytes, run_llm: Callable, r: redis.Redis):
+    """Parses a job payload, executes inference, and pushes the result back to Redis."""
     try:
         job = json.loads(raw_job)
     except json.JSONDecodeError:
@@ -94,8 +104,8 @@ def process_job(raw_job, run_llm, r):
     model = job.get("model")
     messages = job.get("messages")
 
-    if not job_id:
-        print(f"Skipping job with no job_id: {job}")
+    if not job_id or not model or not messages:
+        print(f"Skipping job with missing required fields: {job}")
         return
 
     print(f"Running inference for job {job_id} (model={model})...")
@@ -110,18 +120,11 @@ def process_job(raw_job, run_llm, r):
     r.rpush(key, json.dumps(payload))
     r.expire(key, RESPONSE_KEY_TTL)
 
-
-def worker_loop(run_llm):
-    """
-    One polling loop, meant to run on its own thread: each thread gets its
-    own Redis client (a blocking BLPOP call ties up whatever connection it
-    borrows for up to POLL_TIMEOUT seconds, so sharing one client across
-    threads would serialize them right back). Running N of these threads in
-    one process lets that single process hold N jobs in flight at once,
-    instead of needing N separate `python src/llm_worker.py` processes.
-    """
+def worker_loop(run_llm: Callable):
+    """Dedicated polling loop for a single worker thread."""
     r = get_redis_client()
     queue_name = get_queue_name()
+    
     while not _shutdown_requested:
         popped = r.blpop([queue_name], timeout=POLL_TIMEOUT)
         if popped is None:
@@ -129,14 +132,13 @@ def worker_loop(run_llm):
         _, raw_job = popped
         process_job(raw_job, run_llm, r)
 
-
 def main():
-    parser = argparse.ArgumentParser(description="Hermes queue worker: pops jobs off the Redis queue and runs inference for them.")
-    parser.add_argument("-n", "--concurrency", type=int, default=1, metavar="N", help="Number of jobs this single process handles concurrently (default: 1). Raise this instead of running multiple `python src/llm_worker.py` processes.")
+    parser = argparse.ArgumentParser(description="LLM queue worker: pops jobs off the Redis queue and runs inference for them.")
+    parser.add_argument("-n", "--concurrency", type=int, default=10, metavar="N", help="Number of concurrent jobs handled by this process (default: 10).")
     args = parser.parse_args()
 
     run_config = get_run_config_from_json()
-    store_run_config(run_config)  # keeps config_data (used by llm_queue helpers) in sync with this process
+    store_run_config(run_config)  
 
     endpoint = run_config.get("llm_endpoint")
     wait_time = run_config.get("llm_wait_time") or 10
@@ -148,10 +150,11 @@ def main():
     run_llm = build_run_llm(client, wait_time, max_retries)
     queue_name = get_queue_name()
 
+    # Register signals for graceful termination
     signal.signal(signal.SIGINT, _handle_shutdown_signal)
     signal.signal(signal.SIGTERM, _handle_shutdown_signal)
 
-    print(f"Hermes queue worker started ({args.concurrency} concurrent slot(s)). Listening on '{queue_name}' -> {endpoint}. Press Ctrl+C to stop.")
+    print(f"LLM queue worker started ({args.concurrency} concurrent slot(s)). Listening on '{queue_name}' -> {endpoint}. Press Ctrl+C to stop.")
 
     threads = [threading.Thread(target=worker_loop, args=(run_llm,), daemon=True) for _ in range(args.concurrency)]
     for t in threads:
@@ -159,8 +162,7 @@ def main():
     for t in threads:
         t.join()
 
-    print("Shutting down Hermes queue worker.")
-
+    print("Shutting down LLM queue worker.")
 
 if __name__ == "__main__":
     main()

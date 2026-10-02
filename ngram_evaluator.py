@@ -340,14 +340,16 @@ class EvaluationPipeline:
             return [1, 2, 3]
 
     @staticmethod
-    def _prompt_mode() -> Tuple[str, float]:
-        print("\nSelect Evaluation Mode:")
-        print("1: Synonym (Cosine >= 0.8)")
-        print("2: Antonym (Cosine <= -0.8)")
-        mode_choice = input("Enter choice (1 or 2): ").strip()
-        if mode_choice == "2":
+    def _resolve_mode_by_relation(relation_name: str) -> Tuple[str, float]:
+        """Automatically infers mode and threshold based on relation_name from the JSON file."""
+        rel_str = str(relation_name).strip()
+        if rel_str == "8":
+            return "Synonym", 0.8
+        elif rel_str == "10":
             return "Antonym", -0.8
-        return "Synonym", 0.8
+        else:
+            print(f"[Warning] Unknown relation_name '{rel_str}', defaulting to Synonym (>= 0.8)")
+            return "Synonym", 0.8
 
     def run(self) -> None:
         file_path = input("Enter JSON file path: ").strip()
@@ -358,19 +360,20 @@ class EvaluationPipeline:
         with open(file_path, "r", encoding="utf-8") as f:
             json_obj = json.load(f)
 
-        data_entries = json_obj.get("data", [])
+        data_entries = json_obj.get("data", [])[cite: 6]
         if not data_entries:
             print("[Error] No entries found in JSON 'data' field.")
             return
 
+        relation_name = json_obj.get("relation_name", "N/A")[cite: 6]
+        mode, threshold = self._resolve_mode_by_relation(relation_name)
+        print(f"\n[Auto Mode Detection] Detected relation_name: '{relation_name}' -> Mode: {mode} (Threshold: {threshold})")
+
         equality_map = self.tokenizer.scan_token_lengths(data_entries)
-
         gram_levels = self._prompt_gram_levels()
-        mode, threshold = self._prompt_mode()
 
-        llm_name = json_obj.get("llm_name", "unknown_model")
-        task_name = json_obj.get("task_name", "question_answering")
-        relation_name = json_obj.get("relation_name", "N/A")
+        llm_name = json_obj.get("llm_name", "unknown_model")[cite: 6]
+        task_name = json_obj.get("task_name", "question_answering")[cite: 6]
         date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
         for gram_level in gram_levels:
