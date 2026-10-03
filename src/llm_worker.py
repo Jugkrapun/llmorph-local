@@ -1,5 +1,5 @@
 """
-Queue receiver for Hermes (the transformation LLM).
+Queue receiver for the transformation LLM.
 
 This is the only part of the system that actually calls the Hermes LLM
 endpoint for transformation requests: LLMorph itself (llm_runner.py) only
@@ -13,9 +13,6 @@ Run one (or several, for more throughput) with, from the repository root:
     python src/llm_worker.py
 
 Stop with Ctrl+C.
-"""
-"""
-Queue receiver for the LLM workers.
 """
 import argparse
 import json
@@ -44,6 +41,11 @@ AZURE_CONTENT_FILTER_ERRORS = [
 REPETITIVE_PATTERN_ERRORS = [
     "Sorry! We've encountered an issue with repetitive patterns in your prompt."
 ]
+CONTEXT_SIZE_ERRORS = [
+    "Context size has been exceeded",
+    "context_length_exceeded",
+    "maximum context length"
+]
 
 def _handle_shutdown_signal(signum, frame):
     global _shutdown_requested
@@ -66,6 +68,11 @@ def build_run_llm(client: OpenAI, wait_time: int, max_retries: int) -> Callable:
             except Exception as e:
                 error_str = str(e)
                 
+                # Check for Context Size Exceeded (Skip immediately to prevent infinite retry)
+                if any(err.lower() in error_str.lower() for err in CONTEXT_SIZE_ERRORS):
+                    print(f"Warning: Context size exceeded for job. Skipping without retry: {e}")
+                    return "[SKIPPED: Context size has been exceeded]"
+
                 # Check for Azure Content Filtering
                 if any(err in error_str for err in AZURE_CONTENT_FILTER_ERRORS) or getattr(e, 'code', '') == 'content_filter':
                     print("Warning: Content filtering error")
