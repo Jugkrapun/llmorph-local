@@ -1,3 +1,4 @@
+import argparse
 import csv
 import json
 import os
@@ -12,7 +13,6 @@ class Tokenizer:
     """Wraps spaCy for tokenization and per-shot token-length scanning."""
 
     def __init__(self, spacy_model: str = "en_core_web_md"):
-        # Disable heavy neural pipeline components for fast rule-based processing
         self.nlp = spacy.load(spacy_model, disable=["parser", "ner", "tagger"])
 
     def tokenize(self, text: str) -> List[str]:
@@ -331,8 +331,10 @@ class EvaluationPipeline:
         self.exporter = ResultExporter()
 
     @staticmethod
-    def _prompt_gram_levels() -> List[int]:
-        gram_input = input("\nEnter N-Gram levels to run, comma-separated (e.g., 1,2,3): ").strip()
+    def _parse_gram_levels(gram_input: Optional[str]) -> List[int]:
+        """Parses comma-separated n-gram levels from args or manual input."""
+        if not gram_input:
+            gram_input = input("\nEnter N-Gram levels to run, comma-separated (e.g., 1,2,3): ").strip()
         try:
             gram_levels = sorted(set(int(g.strip()) for g in gram_input.split(",") if g.strip()))
             return [g for g in gram_levels if g >= 1] or [1, 2, 3]
@@ -351,8 +353,10 @@ class EvaluationPipeline:
             print(f"[Warning] Unknown relation_name '{rel_str}', defaulting to Synonym (>= 0.8)")
             return "Synonym", 0.8
 
-    def run(self) -> None:
-        file_path = input("Enter JSON file path: ").strip()
+    def run(self, file_path: Optional[str] = None, grams_arg: Optional[str] = None) -> None:
+        if not file_path:
+            file_path = input("Enter JSON file path: ").strip()
+
         if not os.path.exists(file_path):
             print(f"[Error] File not found: '{file_path}'")
             return
@@ -360,20 +364,20 @@ class EvaluationPipeline:
         with open(file_path, "r", encoding="utf-8") as f:
             json_obj = json.load(f)
 
-        data_entries = json_obj.get("data", [])[cite: 6]
+        data_entries = json_obj.get("data", [])
         if not data_entries:
             print("[Error] No entries found in JSON 'data' field.")
             return
 
-        relation_name = json_obj.get("relation_name", "N/A")[cite: 6]
+        relation_name = json_obj.get("relation_name", "N/A")
         mode, threshold = self._resolve_mode_by_relation(relation_name)
         print(f"\n[Auto Mode Detection] Detected relation_name: '{relation_name}' -> Mode: {mode} (Threshold: {threshold})")
 
         equality_map = self.tokenizer.scan_token_lengths(data_entries)
-        gram_levels = self._prompt_gram_levels()
+        gram_levels = self._parse_gram_levels(grams_arg)
 
-        llm_name = json_obj.get("llm_name", "unknown_model")[cite: 6]
-        task_name = json_obj.get("task_name", "question_answering")[cite: 6]
+        llm_name = json_obj.get("llm_name", "unknown_model")
+        task_name = json_obj.get("task_name", "question_answering")
         date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
         for gram_level in gram_levels:
@@ -402,5 +406,25 @@ class EvaluationPipeline:
             )
 
 
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate positional n-gram word substitution semantic consistency.")
+    parser.add_argument(
+        "-p",
+        "--path",
+        type=str,
+        default=None,
+        help="Path to the evaluated test result JSON file.",
+    )
+    parser.add_argument(
+        "-g",
+        "--grams",
+        type=str,
+        default=None,
+        help="Comma-separated n-gram levels (e.g. '1,2,3'). If omitted, defaults or prompts interactively.",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    EvaluationPipeline().run()
+    args = parse_arguments()
+    EvaluationPipeline().run(file_path=args.path, grams_arg=args.grams)
