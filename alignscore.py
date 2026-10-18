@@ -5,8 +5,26 @@ import os
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
+import nltk
 import torch
 from alignscore import AlignScore
+from alignscore.model import BERTAlignModel
+
+# --- Ensure BERTAlignModel.load_from_checkpoint works on instances in PL 2.x ---
+_orig_load_from_ckpt = BERTAlignModel.load_from_checkpoint
+
+
+def _compat_load_from_checkpoint(*args, **kwargs):
+    if args and isinstance(args[0], BERTAlignModel):
+        instance = args[0]
+        args = args[1:]
+        if "model" not in kwargs and hasattr(instance, "model"):
+            kwargs["model"] = instance.model
+    return _orig_load_from_ckpt(*args, **kwargs)
+
+
+BERTAlignModel.load_from_checkpoint = _compat_load_from_checkpoint
+# -------------------------------------------------------------------------------
 
 
 def extract_texts(item: dict) -> Tuple[str, Optional[str]]:
@@ -27,10 +45,8 @@ def resolve_mode_by_relation(relation_name: str) -> Tuple[str, float]:
     """Automatically infers evaluation mode and threshold from relation_name."""
     rel_str = str(relation_name).strip()
     if rel_str == "8":
-        # Synonym: High AlignScore (>= 0.7) indicates strong meaning preservation
         return "Synonym", 0.7
     elif rel_str == "10":
-        # Antonym: Low AlignScore (<= 0.3) indicates semantic contradiction/divergence
         return "Antonym", 0.3
     else:
         print(f"[Warning] Unknown relation_name '{rel_str}', defaulting to Synonym (>= 0.7)")
@@ -47,6 +63,13 @@ def evaluate_json_with_alignscore(
         print(f"[Error] JSON file not found at: '{file_path}'")
         return
 
+    # Download required NLTK tokenizers directly without triggering OSError in nltk.data.find
+    nltk.download("punkt", quiet=True)
+    try:
+        nltk.download("punkt_tab", quiet=True)
+    except Exception:
+        pass
+
     with open(file_path, "r", encoding="utf-8") as f:
         json_obj = json.load(f)
 
@@ -60,7 +83,6 @@ def evaluate_json_with_alignscore(
     relation_name = str(json_obj.get("relation_name", "N/A"))
     mode, threshold = resolve_mode_by_relation(relation_name)
 
-    # Prepare lists for batch processing
     shot_ids: List[int] = []
     contexts: List[str] = []
     claims: List[str] = []
@@ -78,7 +100,6 @@ def evaluate_json_with_alignscore(
         print("[Error] No valid text pairs found for evaluation.")
         return
 
-    # Auto-detect available hardware (CUDA GPU vs. CPU)
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     print(f"\n[Init] Loading AlignScore ({model_name}) on {device}...")
 
@@ -93,13 +114,11 @@ def evaluate_json_with_alignscore(
     print(f"[Run] Computing AlignScore for {len(contexts)} shots...")
     scores = scorer.score(contexts=contexts, claims=claims)
 
-    # Evaluate scores against threshold and compile results
     passed_count = 0
     records: List[Dict] = []
 
     for shot_id, src, fol, score in zip(shot_ids, contexts, claims, scores):
         score_val = float(score)
-        # Synonym requires score >= threshold; Antonym requires score <= threshold
         is_pass = (score_val >= threshold) if mode == "Synonym" else (score_val <= threshold)
         if is_pass:
             passed_count += 1
@@ -112,10 +131,8 @@ def evaluate_json_with_alignscore(
             "align_score": round(score_val, 4),
         })
 
-    # Calculate Pass Percentage (0.0 to 100.0)
     pass_percentage = (passed_count / len(records) * 100.0) if records else 0.0
 
-    # Display evaluation summary
     print("\n================ ALIGNSCORE EVALUATION RESULTS ================")
     print(f"Model Evaluated:          {llm_name}")
     print(f"Task:                     {task_name} (Relation {relation_name})")
@@ -125,12 +142,10 @@ def evaluate_json_with_alignscore(
     print(f"Pass Percentage:          {pass_percentage:.2f}%")
     print("===============================================================")
 
-    # Prepare output directory and timestamp
-    output_dir = os.path.join("Alignscore-logs", mode.capitalize(), "alignscore")
+    output_dir = os.path.join("logs", mode.capitalize(), "alignscore")
     os.makedirs(output_dir, exist_ok=True)
     date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    # Export detailed records to CSV
     csv_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_alignscore.csv"
     csv_path = os.path.join(output_dir, csv_filename)
 
@@ -148,7 +163,6 @@ def evaluate_json_with_alignscore(
 
     print(f"[Saved] CSV results saved to: '{csv_path}'")
 
-    # Export evaluation summary log to TXT
     log_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_alignscore_summary.txt"
     log_path = os.path.join(output_dir, log_filename)
 
@@ -178,34 +192,10 @@ def evaluate_json_with_alignscore(
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate JSON dataset using AlignScore metric.")
-    parser.add_argument(
-        "-p",
-        "--path",
-        type=str,
-        required=True,
-        help="Path to the evaluated test result JSON file.",
-    )
-    parser.add_argument(
-        "-c",
-        "--ckpt",
-        type=str,
-        default="AlignScore-base.ckpt",
-        help="Path to the AlignScore checkpoint (.ckpt) file.",
-    )
-    parser.add_argument(
-        "-m",
-        "--model",
-        type=str,
-        default="roberta-base",
-        help="Backbone model name (e.g., 'roberta-base' or 'roberta-large').",
-    )
-    parser.add_argument(
-        "-b",
-        "--batch_size",
-        type=int,
-        default=32,
-        help="Batch size for inference (default: 32).",
-    )
+    parser.add_argument("-p", "--path", type=str, required=True, help="Path to the evaluated test result JSON file.")
+    parser.add_argument("-c", "--ckpt", type=str, default="AlignScore-base.ckpt", help="Path to checkpoint (.ckpt).")
+    parser.add_argument("-m", "--model", type=str, default="roberta-base", help="Backbone model name.")
+    parser.add_argument("-b", "--batch_size", type=int, default=32, help="Batch size for inference.")
     return parser.parse_args()
 
 
