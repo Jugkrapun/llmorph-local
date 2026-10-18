@@ -126,7 +126,7 @@ def evaluate_json_with_alignscore(
     print("===============================================================")
 
     # Prepare output directory and timestamp
-    output_dir = os.path.join("logs", mode.capitalize(), "alignscore")
+    output_dir = os.path.join("Alignscore-logs", mode.capitalize(), "alignscore")
     os.makedirs(output_dir, exist_ok=True)
     date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
