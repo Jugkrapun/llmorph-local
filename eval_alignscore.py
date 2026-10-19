@@ -126,19 +126,29 @@ def pair_ngrams(src_ngrams: List[str], fol_ngrams: List[str]) -> List[Tuple[str,
     return pairs
 
 
-def evaluate_wordnet_antonym_alignment(
+def resolve_evaluation_config(relation_name: str) -> Tuple[str, float]:
+    """Automatically infers evaluation mode and threshold based on relation ID."""
+    rel_str = str(relation_name).strip()
+    if rel_str == "8":
+        return "Synonym", 0.8
+    elif rel_str == "10":
+        return "Antonym_WordNet", 0.8
+    else:
+        print(f"[Warning] Unknown relation_name '{rel_str}', defaulting to Synonym (Threshold >= 0.8)")
+        return "Synonym", 0.8
+
+
+def evaluate_dataset(
     file_path: str,
     ckpt_path: str = "AlignScore-base.ckpt",
     model_name: str = "roberta-base",
     batch_size: int = 64,
     ngram_order: int = 1,
-    threshold: float = 0.5,
 ) -> None:
     """
-    Core Evaluation Algorithm:
-    1. Extract source and transformed chunks via SequenceMatcher.
-    2. Lookup the source chunk's true linguistic antonym in WordNet.
-    3. Evaluate AlignScore between the LLM's Transformed Chunk and the WordNet Antonym.
+    Comprehensive Unified Evaluation Algorithm:
+    - Relation 8 (Synonym): Evaluates Source Chunk directly vs Transformed Chunk (Threshold >= 0.7).
+    - Relation 10 (Antonym): Evaluates WordNet Antonym vs Transformed Chunk (Threshold >= 0.5).
     """
     if not os.path.exists(file_path):
         print(f"[Error] JSON file not found at: '{file_path}'")
@@ -162,6 +172,9 @@ def evaluate_wordnet_antonym_alignment(
     llm_name = json_obj.get("llm_name", "unknown_model")
     task_name = json_obj.get("task_name", "question_answering")
     relation_name = str(json_obj.get("relation_name", "N/A"))
+    
+    # Automatically resolve evaluation mode and threshold based on relation ID
+    mode, align_threshold = resolve_evaluation_config(relation_name)
 
     all_evaluated_items = []
 
@@ -183,29 +196,42 @@ def evaluate_wordnet_antonym_alignment(
 
         pairs = pair_ngrams(src_ng, fol_ng)
         for s_chunk, f_chunk in pairs:
-            if not s_chunk.strip() or not f_chunk.strip():
+            if not s_chunk.strip() and not f_chunk.strip():
                 continue
             if s_chunk.lower() == f_chunk.lower():
                 continue
 
-            wordnet_ant = get_wordnet_antonym(s_chunk)
-            if not wordnet_ant:
-                continue
-
-            all_evaluated_items.append({
-                "shot_id": shot_id,
-                "source_chunk": s_chunk,
-                "wordnet_antonym": wordnet_ant,
-                "transformed_chunk": f_chunk
-            })
+            if mode == "Synonym":
+                # Synonym Case: Compare source chunk directly with transformed output chunk
+                all_evaluated_items.append({
+                    "shot_id": shot_id,
+                    "context_chunk": s_chunk,
+                    "claim_chunk": f_chunk,
+                    "display_source": s_chunk,
+                    "display_target": f_chunk
+                })
+            else:
+                # Antonym WordNet Case: Compare true WordNet antonym with transformed output chunk
+                wordnet_ant = get_wordnet_antonym(s_chunk)
+                if not wordnet_ant:
+                    continue
+                all_evaluated_items.append({
+                    "shot_id": shot_id,
+                    "context_chunk": wordnet_ant,
+                    "claim_chunk": f_chunk,
+                    "display_source": s_chunk,
+                    "wordnet_antonym": wordnet_ant,
+                    "display_target": f_chunk
+                })
 
     if not all_evaluated_items:
-        print("[Error] No valid chunk pairs found with WordNet antonym mappings.")
+        print("[Error] No valid chunk pairs found for evaluation.")
         return
 
-    print(f"\n[Info] Found a total of {len(all_evaluated_items):,} chunks with valid WordNet antonyms.")
+    print(f"\n[Info] Found a total of {len(all_evaluated_items):,} chunks to evaluate under mode: {mode}.")
 
-    unique_pairs = list(set((item["wordnet_antonym"], item["transformed_chunk"]) for item in all_evaluated_items))
+    # Deduplicate unique pairs for efficient batch inference
+    unique_pairs = list(set((item["context_chunk"], item["claim_chunk"]) for item in all_evaluated_items))
     print(f"[Init] Deduplicated to {len(unique_pairs):,} unique pairs for batch inference.")
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -219,22 +245,22 @@ def evaluate_wordnet_antonym_alignment(
         evaluation_mode="nli_sp",
     )
 
-    print(f"[Run] Computing AlignScore between WordNet Antonyms and Transformed Chunks...")
+    print(f"[Run] Computing AlignScore for unique chunk pairs...")
     
     pair_score_lookup = {}
     valid_pairs = []
 
     for pair in unique_pairs:
-        ant_c, trans_c = pair
-        if not ant_c.strip() or not trans_c.strip():
+        ctx_c, clm_c = pair
+        if not ctx_c.strip() or not clm_c.strip():
             pair_score_lookup[pair] = 0.0
         else:
             valid_pairs.append(pair)
 
     if valid_pairs:
-        batch_ant = [p[0] for p in valid_pairs]
-        batch_trans = [p[1] for p in valid_pairs]
-        raw_scores = scorer.score(contexts=batch_ant, claims=batch_trans)
+        batch_ctx = [p[0] for p in valid_pairs]
+        batch_clm = [p[1] for p in valid_pairs]
+        raw_scores = scorer.score(contexts=batch_ctx, claims=batch_clm)
         for pair, sc in zip(valid_pairs, raw_scores):
             pair_score_lookup[pair] = float(sc)
 
@@ -242,38 +268,42 @@ def evaluate_wordnet_antonym_alignment(
     records = []
 
     for item in all_evaluated_items:
-        s_chunk = item["source_chunk"]
-        ant_chunk = item["wordnet_antonym"]
-        t_chunk = item["transformed_chunk"]
-        
-        score_val = pair_score_lookup.get((ant_chunk, t_chunk), 0.0)
+        ctx_c = item["context_chunk"]
+        clm_c = item["claim_chunk"]
+        score_val = pair_score_lookup.get((ctx_c, clm_c), 0.0)
 
-        is_pass = score_val >= threshold
+        # PASS if score meets or exceeds threshold
+        is_pass = score_val >= align_threshold
         if is_pass:
             passed_count += 1
 
-        records.append({
+        record_entry = {
             "shot_id": item["shot_id"],
             "status": "PASS" if is_pass else "FAIL",
             "align_score": round(score_val, 4),
-            "source_chunk": s_chunk,
-            "wordnet_antonym": ant_chunk,
-            "transformed_chunk": t_chunk
-        })
+            "source_chunk": item["display_source"],
+            "transformed_chunk": item["display_target"]
+        }
+        if mode == "Antonym_WordNet":
+            record_entry["wordnet_antonym"] = item["wordnet_antonym"]
+
+        records.append(record_entry)
 
     total_chunks = len(records)
     pass_percentage = (passed_count / total_chunks * 100.0) if total_chunks > 0 else 0.0
 
-    print("\n================ WORDNET ANTONYM ALIGNSCORE RESULTS ================")
+    print("\n================ COMPREHENSIVE ALIGNSCORE RESULTS ================")
     print(f"Model Evaluated:          {llm_name}")
     print(f"Task:                     {task_name} (Relation {relation_name})")
-    print(f"Threshold (>=):           {threshold}")
+    print(f"Evaluation Mode:          {mode}")
+    print(f"Threshold (>=):           {align_threshold}")
     print(f"N-gram Order Evaluated:   {ngram_order}-gram")
     print(f"Total Evaluated Chunks:   {total_chunks:,}")
     print(f"Passed Chunks:            {passed_count:,}")
     print(f"Pass Percentage:          {pass_percentage:.2f}%")
-    print("====================================================================")
+    print("==================================================================")
 
+    # Automatically structure output directory path: logs/{Mode}/{ProjectName}/alignscore_chunks
     abs_path = os.path.abspath(file_path)
     path_parts = abs_path.split(os.sep)
     project_folder = "llm-nlpaug"
@@ -285,38 +315,36 @@ def evaluate_wordnet_antonym_alignment(
         if len(path_parts) >= 3:
             project_folder = path_parts[-3]
 
-    output_dir = os.path.join("logs", "Antonym_WordNet", project_folder, "alignscore")
+    output_dir = os.path.join("logs", mode, project_folder, "alignscore")
     os.makedirs(output_dir, exist_ok=True)
     date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    csv_filename = f"{llm_name}_rel{relation_name}_wordnet_ant_{date_str}_{ngram_order}gram.csv"
-    csv_path = os.path.join(output_dir, csv_filename)
+    file_prefix = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram"
 
+    # Export CSV file
+    csv_path = os.path.join(output_dir, f"{file_prefix}.csv")
     with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, quoting=csv.QUOTE_ALL)
-        writer.writerow(["Shot_ID", "Status", "AlignScore", "Source_Chunk", "WordNet_Antonym", "Transformed_Chunk"])
-        for r in records:
-            writer.writerow([
-                f"#{r['shot_id']}",
-                r["status"],
-                f"{r['align_score']:.4f}",
-                r["source_chunk"],
-                r["wordnet_antonym"],
-                r["transformed_chunk"],
-            ])
+        if mode == "Antonym":
+            writer.writerow(["Shot_ID", "Status", "AlignScore", "Source_Chunk", "WordNet_Antonym", "Transformed_Chunk"])
+            for r in records:
+                writer.writerow([f"#{r['shot_id']}", r["status"], f"{r['align_score']:.4f}", r["source_chunk"], r["wordnet_antonym"], r["transformed_chunk"]])
+        else:
+            writer.writerow(["Shot_ID", "Status", "AlignScore", "Source_Chunk", "Transformed_Chunk"])
+            for r in records:
+                writer.writerow([f"#{r['shot_id']}", r["status"], f"{r['align_score']:.4f}", r["source_chunk"], r["transformed_chunk"]])
     print(f"[Saved] CSV results saved to: '{csv_path}'")
 
-    json_filename = f"{llm_name}_rel{relation_name}_wordnet_ant_{date_str}_{ngram_order}gram.json"
-    json_path = os.path.join(output_dir, json_filename)
-
+    # Export JSON file
+    json_path = os.path.join(output_dir, f"{file_prefix}.json")
     with open(json_path, mode="w", encoding="utf-8") as f:
         json.dump({
             "timestamp": date_str,
             "model_evaluated": llm_name,
             "task_name": task_name,
             "relation_name": relation_name,
-            "evaluation_mode": "WordNet_Antonym_Alignment",
-            "score_threshold": threshold,
+            "evaluation_mode": mode,
+            "score_threshold": align_threshold,
             "ngram_order": ngram_order,
             "total_chunks": total_chunks,
             "passed_chunks": passed_count,
@@ -325,19 +353,18 @@ def evaluate_wordnet_antonym_alignment(
         }, f, ensure_ascii=False, indent=4)
     print(f"[Saved] JSON log saved to: '{json_path}'")
 
-    log_filename = f"{llm_name}_rel{relation_name}_wordnet_ant_{date_str}_{ngram_order}gram_summary.txt"
-    log_path = os.path.join(output_dir, log_filename)
-
+    # Export TXT Summary log file
+    log_path = os.path.join(output_dir, f"{file_prefix}_summary.txt")
     summary_lines = [
         "=" * 60,
-        f"        WORDNET ANTONYM ALIGNSCORE SUMMARY",
+        f"        COMPREHENSIVE ALIGNSCORE SUMMARY ({mode.upper()})",
         "=" * 60,
         f"Timestamp:                 {date_str}",
         f"Model Evaluated:           {llm_name}",
         f"Task Name:                 {task_name}",
         f"Relation ID:               {relation_name}",
-        f"Evaluation Mode:           WordNet_Antonym_Alignment",
-        f"Score Threshold:           {threshold}",
+        f"Evaluation Mode:           {mode}",
+        f"Score Threshold:           {align_threshold}",
         f"N-gram Order:              {ngram_order}",
         "-" * 60,
         f"Total Evaluated Chunks:    {total_chunks:,}",
@@ -345,30 +372,27 @@ def evaluate_wordnet_antonym_alignment(
         f"Pass Percentage:           {pass_percentage:.2f}%",
         "=" * 60,
     ]
-
     with open(log_path, mode="w", encoding="utf-8") as f:
         f.write("\n".join(summary_lines) + "\n")
     print(f"[Saved] Summary log saved to: '{log_path}'")
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate transformed chunks against WordNet Antonyms using AlignScore.")
+    parser = argparse.ArgumentParser(description="Comprehensive evaluation script supporting both Synonym and Antonym WordNet modes.")
     parser.add_argument("-p", "--path", type=str, required=True, help="Path to evaluated test result JSON file.")
     parser.add_argument("-c", "--ckpt", type=str, default="AlignScore-base.ckpt", help="Path to checkpoint (.ckpt).")
     parser.add_argument("-m", "--model", type=str, default="roberta-base", help="Backbone model name.")
     parser.add_argument("-b", "--batch_size", type=int, default=64, help="Batch size for inference.")
     parser.add_argument("-g", "--ngram", type=int, default=1, help="Specify n-gram order (e.g., -g 1, -g 2).")
-    parser.add_argument("-t", "--threshold", type=float, default=0.5, help="Threshold for aligning with WordNet antonym.")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_arguments()
-    evaluate_wordnet_antonym_alignment(
+    evaluate_dataset(
         file_path=args.path,
         ckpt_path=args.ckpt,
         model_name=args.model,
         batch_size=args.batch_size,
         ngram_order=args.ngram,
-        threshold=args.threshold,
     )
