@@ -75,8 +75,9 @@ def get_ngram_strings(tokens: List[str], n: int) -> List[str]:
 
 def pair_ngrams(src_ngrams: List[str], fol_ngrams: List[str]) -> List[Tuple[str, str]]:
     """
-    Pairs source n-grams and followup n-grams using SequenceMatcher 
-    to prevent positional shifting (domino effect) when words are inserted/deleted.
+    Pairs source and followup n-grams using SequenceMatcher.
+    Explicitly handles 'equal', 'replace', 'delete', and 'insert' opcodes.
+    Deleted and inserted words are mapped to empty strings to ensure proper penalization.
     """
     if not src_ngrams or not fol_ngrams:
         return []
@@ -96,6 +97,12 @@ def pair_ngrams(src_ngrams: List[str], fol_ngrams: List[str]) -> List[Tuple[str,
                 s_idx = s_range[min(i, len(s_range) - 1)]
                 f_idx = f_range[min(i, len(f_range) - 1)]
                 pairs.append((src_ngrams[s_idx], fol_ngrams[f_idx]))
+        elif tag == 'delete':
+            for s_idx in range(i1, i2):
+                pairs.append((src_ngrams[s_idx], ""))
+        elif tag == 'insert':
+            for f_idx in range(j1, j2):
+                pairs.append(("", fol_ngrams[f_idx]))
 
     return pairs
 
@@ -112,14 +119,14 @@ def resolve_mode_by_relation(relation_name: str) -> Tuple[str, float]:
         return "Synonym", 0.7
 
 
-def evaluate_global_chunks_alignscore(
+def evaluate_chunks_alignscore(
     file_path: str,
     ckpt_path: str = "AlignScore-base.ckpt",
     model_name: str = "roberta-base",
     batch_size: int = 64,
     ngram_order: int = 1,
 ) -> None:
-    """Extracts all changed n-gram chunks globally across the dataset using SequenceMatcher, evaluates them, and computes global pass percentage."""
+    """Extracts all changed/inserted/deleted n-gram chunks across the dataset, evaluates them, and computes pass percentage."""
     if not os.path.exists(file_path):
         print(f"[Error] JSON file not found at: '{file_path}'")
         return
@@ -171,10 +178,10 @@ def evaluate_global_chunks_alignscore(
                 })
 
     if not all_extracted_chunks:
-        print("[Error] No changed n-gram chunks found for evaluation.")
+        print("[Error] No modified n-gram chunks found for evaluation.")
         return
 
-    print(f"\n[Info] Found a total of {len(all_extracted_chunks):,} changed {ngram_order}-gram chunks globally.")
+    print(f"\n[Info] Found a total of {len(all_extracted_chunks):,} evaluated chunks (diff/insert/delete).")
 
     unique_pairs = list(set((c["source_chunk"], c["transformed_chunk"]) for c in all_extracted_chunks))
     print(f"[Init] Deduplicated to {len(unique_pairs):,} unique chunk pairs for batch inference.")
@@ -224,17 +231,22 @@ def evaluate_global_chunks_alignscore(
     total_chunks = len(records)
     pass_percentage = (passed_chunks_count / total_chunks * 100.0) if total_chunks > 0 else 0.0
 
-    print("\n================ GLOBAL CHUNK-LEVEL ALIGNSCORE RESULTS ================")
+    print("\n================ CHUNK-LEVEL ALIGNSCORE RESULTS ================")
     print(f"Model Evaluated:          {llm_name}")
     print(f"Task:                     {task_name} (Relation {relation_name})")
     print(f"Mode:                     {mode} (Threshold: {align_threshold})")
     print(f"N-gram Order Evaluated:   {ngram_order}-gram")
     print(f"Total Evaluated Chunks:   {total_chunks:,}")
     print(f"Passed Chunks:            {passed_chunks_count:,}")
-    print(f"Global Pass Percentage:   {pass_percentage:.2f}%")
-    print("=======================================================================")
+    print(f"Pass Percentage:          {pass_percentage:.2f}%")
+    print("================================================================")
 
-    output_dir = os.path.join("logs", mode.capitalize(), "alignscore_global_chunks")
+    # --- Dynamic output directory derived from file path (-p) ---
+    path_dir_name = os.path.basename(os.path.dirname(os.path.abspath(file_path)))
+    if not path_dir_name or path_dir_name in ["results", "data", "."]:
+        path_dir_name = os.path.splitext(os.path.basename(file_path))[0]
+
+    output_dir = os.path.join("logs", path_dir_name, "alignscore_chunks")
     os.makedirs(output_dir, exist_ok=True)
     date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
@@ -259,7 +271,7 @@ def evaluate_global_chunks_alignscore(
 
     summary_lines = [
         "=" * 60,
-        f"    GLOBAL CHUNK-LEVEL {ngram_order}-GRAM ALIGNSCORE SUMMARY",
+        f"        CHUNK-LEVEL {ngram_order}-GRAM ALIGNSCORE SUMMARY",
         "=" * 60,
         f"Timestamp:                 {date_str}",
         f"Model Evaluated:           {llm_name}",
@@ -271,7 +283,7 @@ def evaluate_global_chunks_alignscore(
         "-" * 60,
         f"Total Evaluated Chunks:    {total_chunks:,}",
         f"Passed Chunks:             {passed_chunks_count:,}",
-        f"Pass Percentage:    {pass_percentage:.2f}%",
+        f"Pass Percentage:           {pass_percentage:.2f}%",
         "=" * 60,
     ]
 
@@ -302,7 +314,7 @@ def evaluate_global_chunks_alignscore(
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate all changed n-gram chunks globally using SequenceMatcher.")
+    parser = argparse.ArgumentParser(description="Evaluate all changed/inserted/deleted n-gram chunks using SequenceMatcher.")
     parser.add_argument("-p", "--path", type=str, required=True, help="Path to the evaluated test result JSON file.")
     parser.add_argument("-c", "--ckpt", type=str, default="AlignScore-base.ckpt", help="Path to checkpoint (.ckpt).")
     parser.add_argument("-m", "--model", type=str, default="roberta-base", help="Backbone model name.")
@@ -313,7 +325,7 @@ def parse_arguments() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_arguments()
-    evaluate_global_chunks_alignscore(
+    evaluate_chunks_alignscore(
         file_path=args.path,
         ckpt_path=args.ckpt,
         model_name=args.model,
