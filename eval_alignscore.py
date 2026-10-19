@@ -7,24 +7,63 @@ from collections import Counter
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
+import nltk
+import spacy
+import torch
+from alignscore import AlignScore
+import alignscore.inference as align_inf
+from alignscore.model import BERTAlignModel
+
+
+# --- Monkey-patch AlignScore Inferencer to support PyTorch Lightning 2.x ---
+def _patched_inferencer_init(
+    self,
+    ckpt_path,
+    model="bert-base-uncased",
+    batch_size=32,
+    device="cuda",
+    verbose=True,
+):
+    """Patches AlignScore Inferencer initialization to be compatible with PyTorch Lightning 2.x."""
+    self.device = device
+    if ckpt_path is not None:
+        self.model = BERTAlignModel.load_from_checkpoint(
+            checkpoint_path=ckpt_path, model=model, strict=False
+        ).to(self.device)
+    else:
+        self.model = BERTAlignModel(model=model).to(self.device)
+    self.model.eval()
+    self.batch_size = batch_size
+    self.spacy = spacy.load("en_core_web_sm")
+    self.loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+    self.softmax = torch.nn.Softmax(dim=-1)
+    self.smart_type = "smart-n"
+    self.smart_n_metric = "f1"
+    self.disable_progress_bar_in_inference = False
+    self.verbose = verbose
+
+
+align_inf.Inferencer.__init__ = _patched_inferencer_init
+# ---------------------------------------------------------------------------
+
 
 def tokenize(text: str) -> List[str]:
-    """Tokenizes text into lowercase words."""
+    """Tokenizes input text into a list of lowercase words."""
     return re.findall(r"\w+", text.lower())
 
 
 def get_ngrams(tokens: List[str], n: int) -> List[tuple]:
-    """Generates n-grams for a given n."""
+    """Generates n-grams of size n from the token list."""
     return [tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1)]
 
 
-def calculate_ngram_metrics(src_text: str, fol_text: str) -> Dict[str, float]:
-    """Computes overlap scores for 1-gram, 2-gram, and 3-gram."""
+def calculate_ngram_metrics(src_text: str, fol_text: str, n_values: List[int]) -> Dict[str, float]:
+    """Computes Jaccard similarity-based overlap scores for specified n-gram sizes."""
     src_tokens = tokenize(src_text)
     fol_tokens = tokenize(fol_text)
 
     metrics = {}
-    for n in range(1, 4):
+    for n in n_values:
         src_ngrams = get_ngrams(src_tokens, n)
         fol_ngrams = get_ngrams(fol_tokens, n)
 
@@ -35,7 +74,7 @@ def calculate_ngram_metrics(src_text: str, fol_text: str) -> Dict[str, float]:
         src_counter = Counter(src_ngrams)
         fol_counter = Counter(fol_ngrams)
 
-        # Intersection over Union (Jaccard Similarity) for n-grams
+        # Calculate intersection and union for n-gram frequency counters
         intersection = sum((src_counter & fol_counter).values())
         union = sum((src_counter | fol_counter).values())
 
@@ -46,7 +85,7 @@ def calculate_ngram_metrics(src_text: str, fol_text: str) -> Dict[str, float]:
 
 
 def extract_texts(item: dict) -> Tuple[str, Optional[str]]:
-    """Extracts source and transformed texts from a dataset JSON entry."""
+    """Extracts source input text and transformed followup text from a dataset JSON entry."""
     src_input = item.get("source_input", [])
     src_text = " ".join(src_input) if isinstance(src_input, list) else str(src_input)
 
@@ -59,13 +98,36 @@ def extract_texts(item: dict) -> Tuple[str, Optional[str]]:
     return src_text.strip(), fol_text.strip()
 
 
-def evaluate_json_with_ngrams(
+def resolve_mode_by_relation(relation_name: str) -> Tuple[str, float]:
+    """Automatically infers the evaluation mode (Synonym/Antonym) and score threshold based on relation ID."""
+    rel_str = str(relation_name).strip()
+    if rel_str == "8":
+        return "Synonym", 0.7
+    elif rel_str == "10":
+        return "Antonym", 0.3
+    else:
+        print(f"[Warning] Unknown relation_name '{rel_str}', defaulting to Synonym (>= 0.7)")
+        return "Synonym", 0.7
+
+
+def evaluate_json_with_alignscore_and_ngrams(
     file_path: str,
-    threshold: float = 0.5,
+    ckpt_path: str = "AlignScore-base.ckpt",
+    model_name: str = "roberta-base",
+    batch_size: int = 32,
+    ngram_orders: List[int] = [1, 2, 3],
 ) -> None:
+    """Main function to evaluate dataset JSON using hybrid AlignScore and custom N-gram metrics."""
     if not os.path.exists(file_path):
         print(f"[Error] JSON file not found at: '{file_path}'")
         return
+
+    # Download required NLTK tokenizer resources safely
+    nltk.download("punkt", quiet=True)
+    try:
+        nltk.download("punkt_tab", quiet=True)
+    except Exception:
+        pass
 
     with open(file_path, "r", encoding="utf-8") as f:
         json_obj = json.load(f)
@@ -78,85 +140,129 @@ def evaluate_json_with_ngrams(
     llm_name = json_obj.get("llm_name", "unknown_model")
     task_name = json_obj.get("task_name", "question_answering")
     relation_name = str(json_obj.get("relation_name", "N/A"))
+    mode, align_threshold = resolve_mode_by_relation(relation_name)
 
-    passed_count = 0
-    records: List[Dict] = []
+    shot_ids: List[int] = []
+    contexts: List[str] = []
+    claims: List[str] = []
 
     for idx, item in enumerate(data_entries):
         shot_id = item.get("id", idx)
         src_text, fol_text = extract_texts(item)
         if not src_text or not fol_text:
             continue
+        shot_ids.append(shot_id)
+        contexts.append(src_text)
+        claims.append(fol_text)
 
-        # Calculate N-gram metrics (1-gram, 2-gram, 3-gram)
-        ngram_scores = calculate_ngram_metrics(src_text, fol_text)
+    if not contexts:
+        print("[Error] No valid text pairs found for evaluation.")
+        return
+
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    print(f"\n[Init] Loading AlignScore ({model_name}) on {device}...")
+
+    # Initialize AlignScore scorer
+    scorer = AlignScore(
+        model=model_name,
+        batch_size=batch_size,
+        device=device,
+        ckpt_path=ckpt_path,
+        evaluation_mode="nli_sp",
+    )
+
+    print(f"[Run] Computing AlignScore & {ngram_orders}-gram metrics for {len(contexts)} shots...")
+    align_scores = scorer.score(contexts=contexts, claims=claims)
+
+    passed_count = 0
+    records: List[Dict] = []
+
+    for shot_id, src, fol, align_sc in zip(shot_ids, contexts, claims, align_scores):
+        align_val = float(align_sc)
         
-        # Example Pass condition: using average or specific n-gram score against threshold
-        avg_score = sum(ngram_scores.values()) / len(ngram_scores)
-        is_pass = avg_score >= threshold
+        # Calculate custom n-gram metrics based on user specification (-g)
+        ngram_metrics = calculate_ngram_metrics(src, fol, ngram_orders)
+        ngram_values_list = list(ngram_metrics.values())
+        avg_ngram = sum(ngram_values_list) / len(ngram_values_list) if ngram_values_list else 0.0
+
+        # Define PASS/FAIL criteria combining AlignScore and local N-gram lexical overlap
+        if mode == "Synonym":
+            is_pass = (align_val >= align_threshold) or (avg_ngram >= 0.6)
+        else:
+            is_pass = (align_val <= align_threshold)
 
         if is_pass:
             passed_count += 1
 
-        records.append({
+        record_entry = {
             "shot_id": shot_id,
             "status": "PASS" if is_pass else "FAIL",
-            "1_gram": ngram_scores["1_gram"],
-            "2_gram": ngram_scores["2_gram"],
-            "3_gram": ngram_scores["3_gram"],
-            "avg_ngram_score": round(avg_score, 4),
-            "source_text": src_text,
-            "transformed_text": fol_text,
-        })
+            "align_score": round(align_val, 4),
+        }
+        for k, v in ngram_metrics.items():
+            record_entry[k] = v
+        record_entry["avg_ngram"] = round(avg_ngram, 4)
+        record_entry["source_text"] = src
+        record_entry["transformed_text"] = fol
+
+        records.append(record_entry)
 
     pass_percentage = (passed_count / len(records) * 100.0) if records else 0.0
 
-    print("\n================ N-GRAM EVALUATION RESULTS ================")
+    print("\n================ HYBRID ALIGNSCORE + N-GRAM RESULTS ================")
     print(f"Model Evaluated:          {llm_name}")
     print(f"Task:                     {task_name} (Relation {relation_name})")
-    print(f"Threshold (Avg N-gram):   {threshold}")
+    print(f"Mode:                     {mode} (Align Threshold: {align_threshold})")
+    print(f"N-gram Orders Evaluated:  {ngram_orders}")
     print(f"Total Evaluated Shots:    {len(records)}")
     print(f"Passed Threshold:         {passed_count}")
     print(f"Pass Percentage:          {pass_percentage:.2f}%")
-    print("===========================================================")
+    print("====================================================================")
 
-    output_dir = os.path.join("logs", "Ngram", "evaluation")
+    output_dir = os.path.join("logs", mode.capitalize(), "alignscore_hybrid")
     os.makedirs(output_dir, exist_ok=True)
     date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    # 1. Export detailed records to CSV
-    csv_filename = f"{llm_name}_rel{relation_name}_{date_str}_ngram.csv"
+    # CSV Headers dynamically include requested n-grams
+    csv_headers = ["Shot_ID", "Status", "AlignScore"] + [f"{n}_gram" for n in ngram_orders] + ["Avg_Ngram", "Source_Text", "Transformed_Text"]
+
+    csv_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_hybrid.csv"
     csv_path = os.path.join(output_dir, csv_filename)
 
     with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, quoting=csv.QUOTE_ALL)
-        writer.writerow(["Shot_ID", "Status", "1_gram", "2_gram", "3_gram", "Avg_Score", "Source_Text", "Transformed_Text"])
+        writer.writerow(csv_headers)
         for r in records:
-            writer.writerow([
+            row_data = [
                 f"#{r['shot_id']}",
                 r["status"],
-                f"{r['1_gram']:.4f}",
-                f"{r['2_gram']:.4f}",
-                f"{r['3_gram']:.4f}",
-                f"{r['avg_ngram_score']:.4f}",
+                f"{r['align_score']:.4f}",
+            ]
+            for n in ngram_orders:
+                row_data.append(f"{r.get(f'{n}_gram', 0.0):.4f}")
+            row_data.extend([
+                f"{r['avg_ngram']:.4f}",
                 r["source_text"],
                 r["transformed_text"],
             ])
+            writer.writerow(row_data)
     print(f"[Saved] CSV results saved to: '{csv_path}'")
 
-    # 2. Export summary log to TXT
-    log_filename = f"{llm_name}_rel{relation_name}_{date_str}_ngram_summary.txt"
+    # 2. Export summary log to TXT file
+    log_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_hybrid_summary.txt"
     log_path = os.path.join(output_dir, log_filename)
 
     summary_lines = [
         "=" * 60,
-        "             N-GRAM EVALUATION SUMMARY LOG",
+        "       HYBRID ALIGNSCORE + N-GRAM EVALUATION SUMMARY",
         "=" * 60,
         f"Timestamp:                 {date_str}",
         f"Model Evaluated:           {llm_name}",
         f"Task Name:                 {task_name}",
         f"Relation ID:               {relation_name}",
-        f"Score Threshold:           {threshold}",
+        f"Evaluation Mode:           {mode}",
+        f"Align Threshold:           {align_threshold}",
+        f"N-gram Orders:             {ngram_orders}",
         "-" * 60,
         f"Total Evaluated Shots:     {len(records):,}",
         f"Passed Threshold:          {passed_count:,}",
@@ -168,8 +274,8 @@ def evaluate_json_with_ngrams(
         f.write("\n".join(summary_lines) + "\n")
     print(f"[Saved] Summary log saved to: '{log_path}'")
 
-    # 3. Export complete results to JSON
-    json_filename = f"{llm_name}_rel{relation_name}_{date_str}_ngram.json"
+    # 3. Export complete data to JSON file
+    json_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_hybrid.json"
     json_path = os.path.join(output_dir, json_filename)
 
     json_output = {
@@ -177,7 +283,9 @@ def evaluate_json_with_ngrams(
         "model_evaluated": llm_name,
         "task_name": task_name,
         "relation_name": relation_name,
-        "threshold": threshold,
+        "evaluation_mode": mode,
+        "align_threshold": align_threshold,
+        "ngram_orders": ngram_orders,
         "total_shots": len(records),
         "passed_threshold": passed_count,
         "pass_percentage": round(pass_percentage, 2),
@@ -190,12 +298,22 @@ def evaluate_json_with_ngrams(
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate JSON dataset using N-gram metrics (1, 2, 3-gram).")
+    """Parses command-line arguments."""
+    parser = argparse.ArgumentParser(description="Evaluate JSON dataset using Hybrid AlignScore + Custom N-gram metrics.")
     parser.add_argument("-p", "--path", type=str, required=True, help="Path to the evaluated test result JSON file.")
-    parser.add_argument("-t", "--threshold", type=float, default=0.5, help="Threshold for passing (default: 0.5).")
+    parser.add_argument("-c", "--ckpt", type=str, default="AlignScore-base.ckpt", help="Path to checkpoint (.ckpt).")
+    parser.add_argument("-m", "--model", type=str, default="roberta-base", help="Backbone model name.")
+    parser.add_argument("-b", "--batch_size", type=int, default=32, help="Batch size for inference.")
+    parser.add_argument("-g", "--ngram", type=int, nargs="+", default=[1, 2, 3], help="Specify n-gram orders to calculate (e.g., -g 1 2 3 or -g 1 2).")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_arguments()
-    evaluate_json_with_ngrams(file_path=args.path, threshold=args.threshold)
+    evaluate_json_with_alignscore_and_ngrams(
+        file_path=args.path,
+        ckpt_path=args.ckpt,
+        model_name=args.model,
+        batch_size=args.batch_size,
+        ngram_orders=args.ngram,
+    )
