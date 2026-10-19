@@ -76,8 +76,8 @@ def get_ngram_strings(tokens: List[str], n: int) -> List[str]:
 def pair_ngrams(src_ngrams: List[str], fol_ngrams: List[str]) -> List[Tuple[str, str]]:
     """
     Pairs source and followup n-grams using SequenceMatcher.
-    Explicitly handles 'equal', 'replace', 'delete', and 'insert' opcodes.
-    Deleted and inserted words are mapped to empty strings to ensure proper penalization.
+    Forces all modifications (replace) to be split into strict deletions and insertions
+    paired with empty strings ("") for maximum penalization.
     """
     if not src_ngrams or not fol_ngrams:
         return []
@@ -90,13 +90,11 @@ def pair_ngrams(src_ngrams: List[str], fol_ngrams: List[str]) -> List[Tuple[str,
             for s_idx, f_idx in zip(range(i1, i2), range(j1, j2)):
                 pairs.append((src_ngrams[s_idx], fol_ngrams[f_idx]))
         elif tag == 'replace':
-            s_range = list(range(i1, i2))
-            f_range = list(range(j1, j2))
-            max_len = max(len(s_range), len(f_range))
-            for i in range(max_len):
-                s_idx = s_range[min(i, len(s_range) - 1)]
-                f_idx = f_range[min(i, len(f_range) - 1)]
-                pairs.append((src_ngrams[s_idx], fol_ngrams[f_idx]))
+            # Force split replace into delete and insert with empty strings
+            for s_idx in range(i1, i2):
+                pairs.append((src_ngrams[s_idx], ""))
+            for f_idx in range(j1, j2):
+                pairs.append(("", fol_ngrams[f_idx]))
         elif tag == 'delete':
             for s_idx in range(i1, i2):
                 pairs.append((src_ngrams[s_idx], ""))
@@ -170,6 +168,7 @@ def evaluate_chunks_alignscore(
 
         pairs = pair_ngrams(src_ng, fol_ng)
         for s_chunk, f_chunk in pairs:
+            # Capture any non-identical pairs (including empty string mappings)
             if s_chunk.lower() != f_chunk.lower():
                 all_extracted_chunks.append({
                     "shot_id": shot_id,
@@ -181,7 +180,7 @@ def evaluate_chunks_alignscore(
         print("[Error] No modified n-gram chunks found for evaluation.")
         return
 
-    print(f"\n[Info] Found a total of {len(all_extracted_chunks):,} evaluated chunks (diff/insert/delete).")
+    print(f"\n[Info] Found a total of {len(all_extracted_chunks):,} evaluated chunks (delete/insert).")
 
     unique_pairs = list(set((c["source_chunk"], c["transformed_chunk"]) for c in all_extracted_chunks))
     print(f"[Init] Deduplicated to {len(unique_pairs):,} unique chunk pairs for batch inference.")
@@ -273,7 +272,7 @@ def evaluate_chunks_alignscore(
             ])
     print(f"[Saved] CSV results saved to: '{csv_path}'")
 
-    log_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_chunks_summary.txt"
+    log_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_summary.txt"
     log_path = os.path.join(output_dir, log_filename)
 
     summary_lines = [
@@ -298,7 +297,7 @@ def evaluate_chunks_alignscore(
         f.write("\n".join(summary_lines) + "\n")
     print(f"[Saved] Summary log saved to: '{log_path}'")
 
-    json_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_chunks.json"
+    json_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_.json"
     json_path = os.path.join(output_dir, json_filename)
 
     json_output = {
