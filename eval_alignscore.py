@@ -4,6 +4,7 @@ import json
 import os
 import re
 from datetime import datetime
+from difflib import SequenceMatcher
 from typing import Dict, List, Tuple
 
 import nltk
@@ -73,18 +74,29 @@ def get_ngram_strings(tokens: List[str], n: int) -> List[str]:
 
 
 def pair_ngrams(src_ngrams: List[str], fol_ngrams: List[str]) -> List[Tuple[str, str]]:
-    """Pairs source n-grams and followup n-grams positionally (proportional alignment if lengths differ)."""
+    """
+    Pairs source n-grams and followup n-grams using SequenceMatcher 
+    to prevent positional shifting (domino effect) when words are inserted/deleted.
+    """
     if not src_ngrams or not fol_ngrams:
         return []
-    if len(src_ngrams) == len(fol_ngrams):
-        return list(zip(src_ngrams, fol_ngrams))
 
+    matcher = SequenceMatcher(None, src_ngrams, fol_ngrams)
     pairs = []
-    max_len = max(len(src_ngrams), len(fol_ngrams))
-    for i in range(max_len):
-        s_idx = min(int(i * len(src_ngrams) / max_len), len(src_ngrams) - 1)
-        f_idx = min(int(i * len(fol_ngrams) / max_len), len(fol_ngrams) - 1)
-        pairs.append((src_ngrams[s_idx], fol_ngrams[f_idx]))
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            for s_idx, f_idx in zip(range(i1, i2), range(j1, j2)):
+                pairs.append((src_ngrams[s_idx], fol_ngrams[f_idx]))
+        elif tag == 'replace':
+            s_range = list(range(i1, i2))
+            f_range = list(range(j1, j2))
+            max_len = max(len(s_range), len(f_range))
+            for i in range(max_len):
+                s_idx = s_range[min(i, len(s_range) - 1)]
+                f_idx = f_range[min(i, len(f_range) - 1)]
+                pairs.append((src_ngrams[s_idx], fol_ngrams[f_idx]))
+
     return pairs
 
 
@@ -107,7 +119,7 @@ def evaluate_global_chunks_alignscore(
     batch_size: int = 64,
     ngram_order: int = 1,
 ) -> None:
-    """Extracts all changed n-gram chunks globally across the dataset, evaluates them, and computes global pass percentage."""
+    """Extracts all changed n-gram chunks globally across the dataset using SequenceMatcher, evaluates them, and computes global pass percentage."""
     if not os.path.exists(file_path):
         print(f"[Error] JSON file not found at: '{file_path}'")
         return
@@ -131,7 +143,6 @@ def evaluate_global_chunks_alignscore(
     relation_name = str(json_obj.get("relation_name", "N/A"))
     mode, align_threshold = resolve_mode_by_relation(relation_name)
 
-    # Collect all changed chunks across all entries globally
     all_extracted_chunks = []
 
     for idx, item in enumerate(data_entries):
@@ -152,7 +163,6 @@ def evaluate_global_chunks_alignscore(
 
         pairs = pair_ngrams(src_ng, fol_ng)
         for s_chunk, f_chunk in pairs:
-            # Check if this chunk is changed (case-insensitive check)
             if s_chunk.lower() != f_chunk.lower():
                 all_extracted_chunks.append({
                     "shot_id": shot_id,
@@ -166,7 +176,6 @@ def evaluate_global_chunks_alignscore(
 
     print(f"\n[Info] Found a total of {len(all_extracted_chunks):,} changed {ngram_order}-gram chunks globally.")
 
-    # Deduplicate unique pairs for fast batch inference on GPU
     unique_pairs = list(set((c["source_chunk"], c["transformed_chunk"]) for c in all_extracted_chunks))
     print(f"[Init] Deduplicated to {len(unique_pairs):,} unique chunk pairs for batch inference.")
 
@@ -186,10 +195,8 @@ def evaluate_global_chunks_alignscore(
     batch_fol = [p[1] for p in unique_pairs]
     raw_scores = scorer.score(contexts=batch_src, claims=batch_fol)
 
-    # Map scores back to unique pairs
     pair_score_lookup = {pair: float(sc) for pair, sc in zip(unique_pairs, raw_scores)}
 
-    # Evaluate each global chunk item
     passed_chunks_count = 0
     records = []
 
@@ -231,8 +238,7 @@ def evaluate_global_chunks_alignscore(
     os.makedirs(output_dir, exist_ok=True)
     date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    # 1. Export CSV
-    csv_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_global_chunks.csv"
+    csv_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram.csv"
     csv_path = os.path.join(output_dir, csv_filename)
 
     with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
@@ -248,8 +254,7 @@ def evaluate_global_chunks_alignscore(
             ])
     print(f"[Saved] CSV results saved to: '{csv_path}'")
 
-    # 2. Export TXT Summary
-    log_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_global_chunks_summary.txt"
+    log_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_summary.txt"
     log_path = os.path.join(output_dir, log_filename)
 
     summary_lines = [
@@ -266,7 +271,7 @@ def evaluate_global_chunks_alignscore(
         "-" * 60,
         f"Total Evaluated Chunks:    {total_chunks:,}",
         f"Passed Chunks:             {passed_chunks_count:,}",
-        f"Global Pass Percentage:    {pass_percentage:.2f}%",
+        f"Pass Percentage:    {pass_percentage:.2f}%",
         "=" * 60,
     ]
 
@@ -274,8 +279,7 @@ def evaluate_global_chunks_alignscore(
         f.write("\n".join(summary_lines) + "\n")
     print(f"[Saved] Summary log saved to: '{log_path}'")
 
-    # 3. Export JSON
-    json_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_global_chunks.json"
+    json_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram.json"
     json_path = os.path.join(output_dir, json_filename)
 
     json_output = {
@@ -298,7 +302,7 @@ def evaluate_global_chunks_alignscore(
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate all changed n-gram chunks globally across dataset without shot grouping.")
+    parser = argparse.ArgumentParser(description="Evaluate all changed n-gram chunks globally using SequenceMatcher.")
     parser.add_argument("-p", "--path", type=str, required=True, help="Path to the evaluated test result JSON file.")
     parser.add_argument("-c", "--ckpt", type=str, default="AlignScore-base.ckpt", help="Path to checkpoint (.ckpt).")
     parser.add_argument("-m", "--model", type=str, default="roberta-base", help="Backbone model name.")
