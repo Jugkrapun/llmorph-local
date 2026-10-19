@@ -132,7 +132,7 @@ def resolve_evaluation_config(relation_name: str) -> Tuple[str, float]:
     if rel_str == "8":
         return "Synonym", 0.8
     elif rel_str == "10":
-        return "Antonym_WordNet", 0.8
+        return "Antonym", 0.8
     else:
         print(f"[Warning] Unknown relation_name '{rel_str}', defaulting to Synonym (Threshold >= 0.8)")
         return "Synonym", 0.8
@@ -211,7 +211,7 @@ def evaluate_dataset(
                     "display_target": f_chunk
                 })
             else:
-                # Antonym WordNet Case: Compare true WordNet antonym with transformed output chunk
+                # Antonym Case: Compare true WordNet antonym with transformed output chunk
                 wordnet_ant = get_wordnet_antonym(s_chunk)
                 if not wordnet_ant:
                     continue
@@ -284,7 +284,7 @@ def evaluate_dataset(
             "source_chunk": item["display_source"],
             "transformed_chunk": item["display_target"]
         }
-        if mode == "Antonym_WordNet":
+        if mode == "Antonym":
             record_entry["wordnet_antonym"] = item["wordnet_antonym"]
 
         records.append(record_entry)
@@ -378,7 +378,7 @@ def evaluate_dataset(
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Comprehensive evaluation script supporting both Synonym and Antonym WordNet modes.")
+    parser = argparse.ArgumentParser(description="Comprehensive evaluation script supporting both Synonym and Antonym modes.")
     parser.add_argument("-p", "--path", type=str, required=True, help="Path to evaluated test result JSON file.")
     parser.add_argument("-c", "--ckpt", type=str, default="AlignScore-base.ckpt", help="Path to checkpoint (.ckpt).")
     parser.add_argument("-m", "--model", type=str, default="roberta-base", help="Backbone model name.")
