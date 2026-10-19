@@ -76,8 +76,8 @@ def get_ngram_strings(tokens: List[str], n: int) -> List[str]:
 def pair_ngrams(src_ngrams: List[str], fol_ngrams: List[str]) -> List[Tuple[str, str]]:
     """
     Pairs source and followup n-grams using SequenceMatcher.
-    Forces all modifications (replace) to be split into strict deletions and insertions
-    paired with empty strings ("") for maximum penalization.
+    - 'replace': Handled via standard direct mapping.
+    - 'delete'/'insert': Handled via empty string mapping for strict penalization.
     """
     if not src_ngrams or not fol_ngrams:
         return []
@@ -87,13 +87,15 @@ def pair_ngrams(src_ngrams: List[str], fol_ngrams: List[str]) -> List[Tuple[str,
 
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == 'equal':
-            for s_idx, f_idx in zip(range(i1, i2), range(j1, j2)):
-                pairs.append((src_ngrams[s_idx], fol_ngrams[f_idx]))
+            continue
         elif tag == 'replace':
-            for s_idx in range(i1, i2):
-                pairs.append((src_ngrams[s_idx], ""))
-            for f_idx in range(j1, j2):
-                pairs.append(("", fol_ngrams[f_idx]))
+            s_range = list(range(i1, i2))
+            f_range = list(range(j1, j2))
+            max_len = max(len(s_range), len(f_range))
+            for i in range(max_len):
+                s_idx = s_range[min(i, len(s_range) - 1)]
+                f_idx = f_range[min(i, len(f_range) - 1)]
+                pairs.append((src_ngrams[s_idx], fol_ngrams[f_idx]))
         elif tag == 'delete':
             for s_idx in range(i1, i2):
                 pairs.append((src_ngrams[s_idx], ""))
@@ -167,18 +169,20 @@ def evaluate_chunks_alignscore(
 
         pairs = pair_ngrams(src_ng, fol_ng)
         for s_chunk, f_chunk in pairs:
-            if s_chunk.lower() != f_chunk.lower():
-                all_extracted_chunks.append({
-                    "shot_id": shot_id,
-                    "source_chunk": s_chunk,
-                    "transformed_chunk": f_chunk
-                })
+            # Case-insensitive check for replace pairs (skip if words match ignoring case)
+            if s_chunk.strip() and f_chunk.strip() and s_chunk.lower() == f_chunk.lower():
+                continue
+            all_extracted_chunks.append({
+                "shot_id": shot_id,
+                "source_chunk": s_chunk,
+                "transformed_chunk": f_chunk
+            })
 
     if not all_extracted_chunks:
         print("[Error] No modified n-gram chunks found for evaluation.")
         return
 
-    print(f"\n[Info] Found a total of {len(all_extracted_chunks):,} evaluated chunks (delete/insert).")
+    print(f"\n[Info] Found a total of {len(all_extracted_chunks):,} evaluated chunks (transform/insert/delete).")
 
     unique_pairs = list(set((c["source_chunk"], c["transformed_chunk"]) for c in all_extracted_chunks))
     print(f"[Init] Deduplicated to {len(unique_pairs):,} unique chunk pairs for batch inference.")
@@ -262,7 +266,7 @@ def evaluate_chunks_alignscore(
         if len(path_parts) >= 3:
             project_folder = path_parts[-3]
 
-    output_dir = os.path.join("logs", mode.capitalize(), project_folder, "alignscore")
+    output_dir = os.path.join("logs", mode.capitalize(), project_folder, "alignscore_chunks")
     os.makedirs(output_dir, exist_ok=True)
     date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
@@ -330,7 +334,7 @@ def evaluate_chunks_alignscore(
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate all changed/inserted/deleted n-gram chunks using SequenceMatcher.")
+    parser = argparse.ArgumentParser(description="Evaluate chunks using SequenceMatcher (Transform + Insert/Delete).")
     parser.add_argument("-p", "--path", type=str, required=True, help="Path to the evaluated test result JSON file.")
     parser.add_argument("-c", "--ckpt", type=str, default="AlignScore-base.ckpt", help="Path to checkpoint (.ckpt).")
     parser.add_argument("-m", "--model", type=str, default="roberta-base", help="Backbone model name.")
