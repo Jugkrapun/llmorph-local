@@ -241,12 +241,19 @@ def evaluate_chunks_alignscore(
     print(f"Pass Percentage:          {pass_percentage:.2f}%")
     print("================================================================")
 
-    # --- Dynamic output directory derived from file path (-p) ---
-    path_dir_name = os.path.basename(os.path.dirname(os.path.abspath(file_path)))
-    if not path_dir_name or path_dir_name in ["results", "data", "."]:
-        path_dir_name = os.path.splitext(os.path.basename(file_path))[0]
+    # --- Structured output directory: logs/{Mode}/{ProjectName}/alignscore_chunks ---
+    abs_path = os.path.abspath(file_path)
+    path_parts = abs_path.split(os.sep)
+    project_folder = "llm-nlpaug"
+    for part in path_parts:
+        if "nlpaug" in part or "transform" in part or "dataset" in part:
+            project_folder = part
+            break
+    else:
+        if len(path_parts) >= 3:
+            project_folder = path_parts[-3]
 
-    output_dir = os.path.join("logs", path_dir_name, "alignscore_chunks")
+    output_dir = os.path.join("logs", mode.capitalize(), project_folder, "alignscore")
     os.makedirs(output_dir, exist_ok=True)
     date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
@@ -266,7 +273,7 @@ def evaluate_chunks_alignscore(
             ])
     print(f"[Saved] CSV results saved to: '{csv_path}'")
 
-    log_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_summary.txt"
+    log_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_chunks_summary.txt"
     log_path = os.path.join(output_dir, log_filename)
 
     summary_lines = [
@@ -291,7 +298,7 @@ def evaluate_chunks_alignscore(
         f.write("\n".join(summary_lines) + "\n")
     print(f"[Saved] Summary log saved to: '{log_path}'")
 
-    json_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram.json"
+    json_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_chunks.json"
     json_path = os.path.join(output_dir, json_filename)
 
     json_output = {
