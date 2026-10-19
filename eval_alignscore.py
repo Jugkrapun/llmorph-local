@@ -90,7 +90,6 @@ def pair_ngrams(src_ngrams: List[str], fol_ngrams: List[str]) -> List[Tuple[str,
             for s_idx, f_idx in zip(range(i1, i2), range(j1, j2)):
                 pairs.append((src_ngrams[s_idx], fol_ngrams[f_idx]))
         elif tag == 'replace':
-            # Force split replace into delete and insert with empty strings
             for s_idx in range(i1, i2):
                 pairs.append((src_ngrams[s_idx], ""))
             for f_idx in range(j1, j2):
@@ -168,7 +167,6 @@ def evaluate_chunks_alignscore(
 
         pairs = pair_ngrams(src_ng, fol_ng)
         for s_chunk, f_chunk in pairs:
-            # Capture any non-identical pairs (including empty string mappings)
             if s_chunk.lower() != f_chunk.lower():
                 all_extracted_chunks.append({
                     "shot_id": shot_id,
@@ -197,11 +195,23 @@ def evaluate_chunks_alignscore(
     )
 
     print(f"[Run] Computing AlignScore for unique chunk pairs...")
-    batch_src = [p[0] for p in unique_pairs]
-    batch_fol = [p[1] for p in unique_pairs]
-    raw_scores = scorer.score(contexts=batch_src, claims=batch_fol)
+    
+    valid_pairs = []
+    pair_score_lookup = {}
 
-    pair_score_lookup = {pair: float(sc) for pair, sc in zip(unique_pairs, raw_scores)}
+    for pair in unique_pairs:
+        s_c, f_c = pair
+        if not s_c.strip() or not f_c.strip():
+            pair_score_lookup[pair] = 0.0
+        else:
+            valid_pairs.append(pair)
+
+    if valid_pairs:
+        batch_src = [p[0] for p in valid_pairs]
+        batch_fol = [p[1] for p in valid_pairs]
+        raw_scores = scorer.score(contexts=batch_src, claims=batch_fol)
+        for pair, sc in zip(valid_pairs, raw_scores):
+            pair_score_lookup[pair] = float(sc)
 
     passed_chunks_count = 0
     records = []
@@ -297,7 +307,7 @@ def evaluate_chunks_alignscore(
         f.write("\n".join(summary_lines) + "\n")
     print(f"[Saved] Summary log saved to: '{log_path}'")
 
-    json_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_.json"
+    json_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram.json"
     json_path = os.path.join(output_dir, json_filename)
 
     json_output = {
