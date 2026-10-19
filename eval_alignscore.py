@@ -4,7 +4,7 @@ import json
 import os
 import re
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import nltk
 import spacy
@@ -88,88 +88,8 @@ def pair_ngrams(src_ngrams: List[str], fol_ngrams: List[str]) -> List[Tuple[str,
     return pairs
 
 
-def compute_ngram_alignscores_for_order(
-    scorer: AlignScore,
-    contexts: List[str],
-    claims: List[str],
-    n: int,
-    eval_only_changed: bool = False,
-) -> Tuple[List[float], List[int]]:
-    """
-    Segments source and followup texts into n-grams first, then evaluates each n-gram pair using AlignScore.
-    Identical n-gram pairs automatically receive 1.0 to avoid redundant GPU inference.
-    """
-    unique_changed_pairs = set()
-    shot_pair_lists = []
-
-    for src, fol in zip(contexts, claims):
-        src_tokens = tokenize(src)
-        fol_tokens = tokenize(fol)
-        src_ng = get_ngram_strings(src_tokens, n)
-        fol_ng = get_ngram_strings(fol_tokens, n)
-
-        pairs = pair_ngrams(src_ng, fol_ng)
-        shot_pair_lists.append(pairs)
-
-        for s_chunk, f_chunk in pairs:
-            if s_chunk.lower() != f_chunk.lower():
-                unique_changed_pairs.add((s_chunk, f_chunk))
-
-    # Batch evaluate all unique modified n-gram pairs with AlignScore
-    pair_score_lookup: Dict[Tuple[str, str], float] = {}
-    if unique_changed_pairs:
-        pair_list = list(unique_changed_pairs)
-        batch_src = [p[0] for p in pair_list]
-        batch_fol = [p[1] for p in pair_list]
-        print(f"[Run] Evaluating {len(pair_list):,} unique modified {n}-gram pairs with AlignScore...")
-        raw_scores = scorer.score(contexts=batch_src, claims=batch_fol)
-        for pair, sc in zip(pair_list, raw_scores):
-            pair_score_lookup[pair] = float(sc)
-
-    shot_avg_scores = []
-    shot_changed_counts = []
-
-    for pairs in shot_pair_lists:
-        if not pairs:
-            shot_avg_scores.append(0.0)
-            shot_changed_counts.append(0)
-            continue
-
-        scores = []
-        changed_cnt = 0
-        for s_chunk, f_chunk in pairs:
-            if s_chunk.lower() == f_chunk.lower():
-                if not eval_only_changed:
-                    scores.append(1.0)
-            else:
-                changed_cnt += 1
-                scores.append(pair_score_lookup.get((s_chunk, f_chunk), 0.0))
-
-        if not scores:
-            scores = [1.0]
-
-        shot_avg_scores.append(sum(scores) / len(scores))
-        shot_changed_counts.append(changed_cnt)
-
-    return shot_avg_scores, shot_changed_counts
-
-
-def extract_texts(item: dict) -> Tuple[str, Optional[str]]:
-    """Extracts source input text and transformed followup text from a dataset JSON entry."""
-    src_input = item.get("source_input", [])
-    src_text = " ".join(src_input) if isinstance(src_input, list) else str(src_input)
-
-    followup_list = item.get("followup_inputs", [])
-    if not followup_list or not followup_list[0]:
-        return src_text.strip(), None
-
-    fol_target = followup_list[0]
-    fol_text = " ".join(fol_target) if isinstance(fol_target, list) else str(fol_target)
-    return src_text.strip(), fol_text.strip()
-
-
 def resolve_mode_by_relation(relation_name: str) -> Tuple[str, float]:
-    """Automatically infers the evaluation mode (Synonym/Antonym) and score threshold based on relation ID."""
+    """Automatically infers the evaluation mode and threshold based on relation ID."""
     rel_str = str(relation_name).strip()
     if rel_str == "8":
         return "Synonym", 0.7
@@ -180,15 +100,14 @@ def resolve_mode_by_relation(relation_name: str) -> Tuple[str, float]:
         return "Synonym", 0.7
 
 
-def evaluate_json_with_ngram_alignscore(
+def evaluate_global_chunks_alignscore(
     file_path: str,
     ckpt_path: str = "AlignScore-base.ckpt",
     model_name: str = "roberta-base",
     batch_size: int = 64,
     ngram_order: int = 1,
-    diff_only: bool = False,
 ) -> None:
-    """Main function to segment texts into a specific n-gram order and evaluate pairs using AlignScore."""
+    """Extracts all changed n-gram chunks globally across the dataset, evaluates them, and computes global pass percentage."""
     if not os.path.exists(file_path):
         print(f"[Error] JSON file not found at: '{file_path}'")
         return
@@ -212,25 +131,47 @@ def evaluate_json_with_ngram_alignscore(
     relation_name = str(json_obj.get("relation_name", "N/A"))
     mode, align_threshold = resolve_mode_by_relation(relation_name)
 
-    shot_ids: List[int] = []
-    contexts: List[str] = []
-    claims: List[str] = []
+    # Collect all changed chunks across all entries globally
+    all_extracted_chunks = []
 
     for idx, item in enumerate(data_entries):
         shot_id = item.get("id", idx)
-        src_text, fol_text = extract_texts(item)
-        if not src_text or not fol_text:
-            continue
-        shot_ids.append(shot_id)
-        contexts.append(src_text)
-        claims.append(fol_text)
+        src_input = item.get("source_input", [])
+        src_text = " ".join(src_input) if isinstance(src_input, list) else str(src_input)
 
-    if not contexts:
-        print("[Error] No valid text pairs found for evaluation.")
+        followup_list = item.get("followup_inputs", [])
+        if not followup_list or not followup_list[0]:
+            continue
+        fol_target = followup_list[0]
+        fol_text = " ".join(fol_target) if isinstance(fol_target, list) else str(fol_target)
+
+        src_tokens = tokenize(src_text)
+        fol_tokens = tokenize(fol_text)
+        src_ng = get_ngram_strings(src_tokens, ngram_order)
+        fol_ng = get_ngram_strings(fol_tokens, ngram_order)
+
+        pairs = pair_ngrams(src_ng, fol_ng)
+        for s_chunk, f_chunk in pairs:
+            # Check if this chunk is changed (case-insensitive check)
+            if s_chunk.lower() != f_chunk.lower():
+                all_extracted_chunks.append({
+                    "shot_id": shot_id,
+                    "source_chunk": s_chunk,
+                    "transformed_chunk": f_chunk
+                })
+
+    if not all_extracted_chunks:
+        print("[Error] No changed n-gram chunks found for evaluation.")
         return
 
+    print(f"\n[Info] Found a total of {len(all_extracted_chunks):,} changed {ngram_order}-gram chunks globally.")
+
+    # Deduplicate unique pairs for fast batch inference on GPU
+    unique_pairs = list(set((c["source_chunk"], c["transformed_chunk"]) for c in all_extracted_chunks))
+    print(f"[Init] Deduplicated to {len(unique_pairs):,} unique chunk pairs for batch inference.")
+
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    print(f"\n[Init] Loading AlignScore ({model_name}) on {device}...")
+    print(f"[Init] Loading AlignScore ({model_name}) on {device}...")
 
     scorer = AlignScore(
         model=model_name,
@@ -240,20 +181,22 @@ def evaluate_json_with_ngram_alignscore(
         evaluation_mode="nli_sp",
     )
 
-    print(f"\n[Step] Segmenting texts into {ngram_order}-gram and computing AlignScore...")
-    scores_n, changed_n = compute_ngram_alignscores_for_order(
-        scorer=scorer,
-        contexts=contexts,
-        claims=claims,
-        n=ngram_order,
-        eval_only_changed=diff_only,
-    )
+    print(f"[Run] Computing AlignScore for unique chunk pairs...")
+    batch_src = [p[0] for p in unique_pairs]
+    batch_fol = [p[1] for p in unique_pairs]
+    raw_scores = scorer.score(contexts=batch_src, claims=batch_fol)
 
-    passed_count = 0
-    records: List[Dict] = []
+    # Map scores back to unique pairs
+    pair_score_lookup = {pair: float(sc) for pair, sc in zip(unique_pairs, raw_scores)}
 
-    for i, (shot_id, src, fol) in enumerate(zip(shot_ids, contexts, claims)):
-        score_val = scores_n[i]
+    # Evaluate each global chunk item
+    passed_chunks_count = 0
+    records = []
+
+    for item in all_extracted_chunks:
+        s_chunk = item["source_chunk"]
+        f_chunk = item["transformed_chunk"]
+        score_val = pair_score_lookup.get((s_chunk, f_chunk), 0.0)
 
         if mode == "Synonym":
             is_pass = score_val >= align_threshold
@@ -261,61 +204,57 @@ def evaluate_json_with_ngram_alignscore(
             is_pass = score_val <= align_threshold
 
         if is_pass:
-            passed_count += 1
+            passed_chunks_count += 1
 
-        record_entry = {
-            "shot_id": shot_id,
+        records.append({
+            "shot_id": item["shot_id"],
             "status": "PASS" if is_pass else "FAIL",
-            f"{ngram_order}_gram_alignscore": round(score_val, 4),
-            f"{ngram_order}_gram_changed_chunks": changed_n[i],
-            "source_text": src,
-            "transformed_text": fol,
-        }
-        records.append(record_entry)
+            "align_score": round(score_val, 4),
+            "source_chunk": s_chunk,
+            "transformed_chunk": f_chunk
+        })
 
-    pass_percentage = (passed_count / len(records) * 100.0) if records else 0.0
+    total_chunks = len(records)
+    pass_percentage = (passed_chunks_count / total_chunks * 100.0) if total_chunks > 0 else 0.0
 
-    print("\n================ N-GRAM SEGMENTED ALIGNSCORE RESULTS ================")
+    print("\n================ GLOBAL CHUNK-LEVEL ALIGNSCORE RESULTS ================")
     print(f"Model Evaluated:          {llm_name}")
     print(f"Task:                     {task_name} (Relation {relation_name})")
     print(f"Mode:                     {mode} (Threshold: {align_threshold})")
     print(f"N-gram Order Evaluated:   {ngram_order}-gram")
-    print(f"Scoring Scope:            {'Modified N-grams Only' if diff_only else 'All N-grams (Full Text)'}")
-    print(f"Total Evaluated Shots:    {len(records)}")
-    print(f"Passed Threshold:         {passed_count}")
-    print(f"Pass Percentage:          {pass_percentage:.2f}%")
-    print("=====================================================================")
+    print(f"Total Evaluated Chunks:   {total_chunks:,}")
+    print(f"Passed Chunks:            {passed_chunks_count:,}")
+    print(f"Global Pass Percentage:   {pass_percentage:.2f}%")
+    print("=======================================================================")
 
-    output_dir = os.path.join("logs", mode.capitalize(), "alignscore_ngram")
+    output_dir = os.path.join("logs", mode.capitalize(), "alignscore_global_chunks")
     os.makedirs(output_dir, exist_ok=True)
     date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     # 1. Export CSV
-    csv_headers = ["Shot_ID", "Status", f"{ngram_order}_gram_AlignScore", f"{ngram_order}_gram_Changed_Chunks", "Source_Text", "Transformed_Text"]
-    csv_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_alignscore.csv"
+    csv_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_global_chunks.csv"
     csv_path = os.path.join(output_dir, csv_filename)
 
     with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, quoting=csv.QUOTE_ALL)
-        writer.writerow(csv_headers)
+        writer.writerow(["Shot_ID", "Status", "AlignScore", "Source_Chunk", "Transformed_Chunk"])
         for r in records:
             writer.writerow([
                 f"#{r['shot_id']}",
                 r["status"],
-                f"{r[f'{ngram_order}_gram_alignscore']:.4f}",
-                r[f"{ngram_order}_gram_changed_chunks"],
-                r["source_text"],
-                r["transformed_text"],
+                f"{r['align_score']:.4f}",
+                r["source_chunk"],
+                r["transformed_chunk"],
             ])
     print(f"[Saved] CSV results saved to: '{csv_path}'")
 
     # 2. Export TXT Summary
-    log_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_alignscore_summary.txt"
+    log_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_global_chunks_summary.txt"
     log_path = os.path.join(output_dir, log_filename)
 
     summary_lines = [
         "=" * 60,
-        f"       {ngram_order}-GRAM SEGMENTED ALIGNSCORE SUMMARY",
+        f"    GLOBAL CHUNK-LEVEL {ngram_order}-GRAM ALIGNSCORE SUMMARY",
         "=" * 60,
         f"Timestamp:                 {date_str}",
         f"Model Evaluated:           {llm_name}",
@@ -324,11 +263,10 @@ def evaluate_json_with_ngram_alignscore(
         f"Evaluation Mode:           {mode}",
         f"Score Threshold:           {align_threshold}",
         f"N-gram Order:              {ngram_order}",
-        f"Scoring Scope:             {'Modified N-grams Only' if diff_only else 'All N-grams (Full Text)'}",
         "-" * 60,
-        f"Total Evaluated Shots:     {len(records):,}",
-        f"Passed Threshold:          {passed_count:,}",
-        f"Pass Percentage:           {pass_percentage:.2f}%",
+        f"Total Evaluated Chunks:    {total_chunks:,}",
+        f"Passed Chunks:             {passed_chunks_count:,}",
+        f"Global Pass Percentage:    {pass_percentage:.2f}%",
         "=" * 60,
     ]
 
@@ -337,7 +275,7 @@ def evaluate_json_with_ngram_alignscore(
     print(f"[Saved] Summary log saved to: '{log_path}'")
 
     # 3. Export JSON
-    json_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_alignscore.json"
+    json_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_global_chunks.json"
     json_path = os.path.join(output_dir, json_filename)
 
     json_output = {
@@ -348,9 +286,8 @@ def evaluate_json_with_ngram_alignscore(
         "evaluation_mode": mode,
         "score_threshold": align_threshold,
         "ngram_order": ngram_order,
-        "diff_only": diff_only,
-        "total_shots": len(records),
-        "passed_threshold": passed_count,
+        "total_chunks": total_chunks,
+        "passed_chunks": passed_chunks_count,
         "pass_percentage": round(pass_percentage, 2),
         "records": records,
     }
@@ -361,23 +298,21 @@ def evaluate_json_with_ngram_alignscore(
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate text pairs using a single specified N-gram order with AlignScore.")
+    parser = argparse.ArgumentParser(description="Evaluate all changed n-gram chunks globally across dataset without shot grouping.")
     parser.add_argument("-p", "--path", type=str, required=True, help="Path to the evaluated test result JSON file.")
     parser.add_argument("-c", "--ckpt", type=str, default="AlignScore-base.ckpt", help="Path to checkpoint (.ckpt).")
     parser.add_argument("-m", "--model", type=str, default="roberta-base", help="Backbone model name.")
     parser.add_argument("-b", "--batch_size", type=int, default=64, help="Batch size for inference.")
-    parser.add_argument("-g", "--ngram", type=int, default=1, help="Specify a single n-gram order to evaluate (e.g., -g 1, -g 2, or -g 3).")
-    parser.add_argument("--diff-only", action="store_true", help="If set, computes score ONLY over modified n-gram chunks.")
+    parser.add_argument("-g", "--ngram", type=int, default=1, help="Specify n-gram order (e.g., -g 1, -g 2).")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_arguments()
-    evaluate_json_with_ngram_alignscore(
+    evaluate_global_chunks_alignscore(
         file_path=args.path,
         ckpt_path=args.ckpt,
         model_name=args.model,
         batch_size=args.batch_size,
         ngram_order=args.ngram,
-        diff_only=args.diff_only,
     )
