@@ -10,6 +10,7 @@ from typing import Dict, List, Tuple
 import nltk
 import spacy
 import torch
+from nltk.corpus import wordnet
 from transformers import AutoConfig, AutoTokenizer
 from alignscore import AlignScore
 import alignscore.inference as align_inf
@@ -73,6 +74,21 @@ def get_ngram_strings(tokens: List[str], n: int) -> List[str]:
     return [" ".join(tokens[i : i + n]) for i in range(len(tokens) - n + 1)]
 
 
+def get_wordnet_antonym(word: str) -> str:
+    """
+    Looks up WordNet to find a true linguistic antonym for a given word.
+    Returns the antonym if found, otherwise returns the original word.
+    """
+    antonyms = set()
+    for syn in wordnet.synsets(word):
+        for lemma in syn.lemmas():
+            for ant in lemma.antonyms():
+                antonyms.add(ant.name().replace('_', ' '))
+    if antonyms:
+        return list(antonyms)[0]
+    return word
+
+
 def pair_ngrams(src_ngrams: List[str], fol_ngrams: List[str]) -> List[Tuple[str, str]]:
     """
     Pairs source and followup n-grams using SequenceMatcher.
@@ -131,6 +147,7 @@ def evaluate_chunks_alignscore(
         return
 
     nltk.download("punkt", quiet=True)
+    nltk.download("wordnet", quiet=True)
     try:
         nltk.download("punkt_tab", quiet=True)
     except Exception:
@@ -169,7 +186,6 @@ def evaluate_chunks_alignscore(
 
         pairs = pair_ngrams(src_ng, fol_ng)
         for s_chunk, f_chunk in pairs:
-            # Case-insensitive check for replace pairs (skip if words match ignoring case)
             if s_chunk.strip() and f_chunk.strip() and s_chunk.lower() == f_chunk.lower():
                 continue
             all_extracted_chunks.append({
