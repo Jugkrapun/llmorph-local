@@ -35,7 +35,6 @@ def _patched_inferencer_init(
     self.model.eval()
     self.batch_size = batch_size
 
-    # Safe fallback assignment for config and tokenizer
     try:
         self.config = self.model.config
     except AttributeError:
@@ -146,7 +145,6 @@ def compute_ngram_alignscores_for_order(
                 changed_cnt += 1
                 scores.append(pair_score_lookup.get((s_chunk, f_chunk), 0.0))
 
-        # Fallback if text had no changes at all
         if not scores:
             scores = [1.0]
 
@@ -187,15 +185,14 @@ def evaluate_json_with_ngram_alignscore(
     ckpt_path: str = "AlignScore-base.ckpt",
     model_name: str = "roberta-base",
     batch_size: int = 64,
-    ngram_orders: List[int] = [1, 2, 3],
+    ngram_order: int = 1,
     diff_only: bool = False,
 ) -> None:
-    """Main function to segment texts into n-grams and evaluate n-gram pairs using AlignScore."""
+    """Main function to segment texts into a specific n-gram order and evaluate pairs using AlignScore."""
     if not os.path.exists(file_path):
         print(f"[Error] JSON file not found at: '{file_path}'")
         return
 
-    # Download required NLTK tokenizer resources safely
     nltk.download("punkt", quiet=True)
     try:
         nltk.download("punkt_tab", quiet=True)
@@ -243,33 +240,25 @@ def evaluate_json_with_ngram_alignscore(
         evaluation_mode="nli_sp",
     )
 
-    # Compute N-gram segmented AlignScore for each requested n-gram order
-    order_scores_map: Dict[int, List[float]] = {}
-    order_changed_map: Dict[int, List[int]] = {}
-
-    for n in ngram_orders:
-        print(f"\n[Step] Segmenting texts into {n}-grams and computing AlignScore...")
-        scores_n, changed_n = compute_ngram_alignscores_for_order(
-            scorer=scorer,
-            contexts=contexts,
-            claims=claims,
-            n=n,
-            eval_only_changed=diff_only,
-        )
-        order_scores_map[n] = scores_n
-        order_changed_map[n] = changed_n
+    print(f"\n[Step] Segmenting texts into {ngram_order}-gram and computing AlignScore...")
+    scores_n, changed_n = compute_ngram_alignscores_for_order(
+        scorer=scorer,
+        contexts=contexts,
+        claims=claims,
+        n=ngram_order,
+        eval_only_changed=diff_only,
+    )
 
     passed_count = 0
     records: List[Dict] = []
 
     for i, (shot_id, src, fol) in enumerate(zip(shot_ids, contexts, claims)):
-        shot_n_scores = [order_scores_map[n][i] for n in ngram_orders]
-        avg_align_ngram = sum(shot_n_scores) / len(shot_n_scores) if shot_n_scores else 0.0
+        score_val = scores_n[i]
 
         if mode == "Synonym":
-            is_pass = avg_align_ngram >= align_threshold
+            is_pass = score_val >= align_threshold
         else:
-            is_pass = avg_align_ngram <= align_threshold
+            is_pass = score_val <= align_threshold
 
         if is_pass:
             passed_count += 1
@@ -277,15 +266,11 @@ def evaluate_json_with_ngram_alignscore(
         record_entry = {
             "shot_id": shot_id,
             "status": "PASS" if is_pass else "FAIL",
+            f"{ngram_order}_gram_alignscore": round(score_val, 4),
+            f"{ngram_order}_gram_changed_chunks": changed_n[i],
+            "source_text": src,
+            "transformed_text": fol,
         }
-        for n in ngram_orders:
-            record_entry[f"{n}_gram_alignscore"] = round(order_scores_map[n][i], 4)
-            record_entry[f"{n}_gram_changed_chunks"] = order_changed_map[n][i]
-
-        record_entry["avg_ngram_alignscore"] = round(avg_align_ngram, 4)
-        record_entry["source_text"] = src
-        record_entry["transformed_text"] = fol
-
         records.append(record_entry)
 
     pass_percentage = (passed_count / len(records) * 100.0) if records else 0.0
@@ -294,7 +279,7 @@ def evaluate_json_with_ngram_alignscore(
     print(f"Model Evaluated:          {llm_name}")
     print(f"Task:                     {task_name} (Relation {relation_name})")
     print(f"Mode:                     {mode} (Threshold: {align_threshold})")
-    print(f"N-gram Orders Evaluated:  {ngram_orders}")
+    print(f"N-gram Order Evaluated:   {ngram_order}-gram")
     print(f"Scoring Scope:            {'Modified N-grams Only' if diff_only else 'All N-grams (Full Text)'}")
     print(f"Total Evaluated Shots:    {len(records)}")
     print(f"Passed Threshold:         {passed_count}")
@@ -305,41 +290,32 @@ def evaluate_json_with_ngram_alignscore(
     os.makedirs(output_dir, exist_ok=True)
     date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    # 1. Export detailed results to CSV file
-    csv_headers = (
-        ["Shot_ID", "Status"]
-        + [f"{n}_gram_AlignScore" for n in ngram_orders]
-        + ["Avg_Ngram_AlignScore", "Source_Text", "Transformed_Text"]
-    )
-
-    csv_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_ngram_alignscore.csv"
+    # 1. Export CSV
+    csv_headers = ["Shot_ID", "Status", f"{ngram_order}_gram_AlignScore", f"{ngram_order}_gram_Changed_Chunks", "Source_Text", "Transformed_Text"]
+    csv_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_alignscore.csv"
     csv_path = os.path.join(output_dir, csv_filename)
 
     with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, quoting=csv.QUOTE_ALL)
         writer.writerow(csv_headers)
         for r in records:
-            row_data = [
+            writer.writerow([
                 f"#{r['shot_id']}",
                 r["status"],
-            ]
-            for n in ngram_orders:
-                row_data.append(f"{r.get(f'{n}_gram_alignscore', 0.0):.4f}")
-            row_data.extend([
-                f"{r['avg_ngram_alignscore']:.4f}",
+                f"{r[f'{ngram_order}_gram_alignscore']:.4f}",
+                r[f"{ngram_order}_gram_changed_chunks"],
                 r["source_text"],
                 r["transformed_text"],
             ])
-            writer.writerow(row_data)
     print(f"[Saved] CSV results saved to: '{csv_path}'")
 
-    # 2. Export summary log to TXT file
-    log_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_ngram_alignscore_summary.txt"
+    # 2. Export TXT Summary
+    log_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_alignscore_summary.txt"
     log_path = os.path.join(output_dir, log_filename)
 
     summary_lines = [
         "=" * 60,
-        "       N-GRAM SEGMENTED ALIGNSCORE EVALUATION SUMMARY",
+        f"       {ngram_order}-GRAM SEGMENTED ALIGNSCORE SUMMARY",
         "=" * 60,
         f"Timestamp:                 {date_str}",
         f"Model Evaluated:           {llm_name}",
@@ -347,7 +323,7 @@ def evaluate_json_with_ngram_alignscore(
         f"Relation ID:               {relation_name}",
         f"Evaluation Mode:           {mode}",
         f"Score Threshold:           {align_threshold}",
-        f"N-gram Orders:             {ngram_orders}",
+        f"N-gram Order:              {ngram_order}",
         f"Scoring Scope:             {'Modified N-grams Only' if diff_only else 'All N-grams (Full Text)'}",
         "-" * 60,
         f"Total Evaluated Shots:     {len(records):,}",
@@ -360,8 +336,8 @@ def evaluate_json_with_ngram_alignscore(
         f.write("\n".join(summary_lines) + "\n")
     print(f"[Saved] Summary log saved to: '{log_path}'")
 
-    # 3. Export complete data to JSON file
-    json_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_ngram_alignscore.json"
+    # 3. Export JSON
+    json_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_alignscore.json"
     json_path = os.path.join(output_dir, json_filename)
 
     json_output = {
@@ -371,7 +347,7 @@ def evaluate_json_with_ngram_alignscore(
         "relation_name": relation_name,
         "evaluation_mode": mode,
         "score_threshold": align_threshold,
-        "ngram_orders": ngram_orders,
+        "ngram_order": ngram_order,
         "diff_only": diff_only,
         "total_shots": len(records),
         "passed_threshold": passed_count,
@@ -385,27 +361,13 @@ def evaluate_json_with_ngram_alignscore(
 
 
 def parse_arguments() -> argparse.Namespace:
-    """Parses command-line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Segment source and followup texts into N-grams first, then evaluate N-gram pairs with AlignScore."
-    )
+    parser = argparse.ArgumentParser(description="Evaluate text pairs using a single specified N-gram order with AlignScore.")
     parser.add_argument("-p", "--path", type=str, required=True, help="Path to the evaluated test result JSON file.")
     parser.add_argument("-c", "--ckpt", type=str, default="AlignScore-base.ckpt", help="Path to checkpoint (.ckpt).")
     parser.add_argument("-m", "--model", type=str, default="roberta-base", help="Backbone model name.")
     parser.add_argument("-b", "--batch_size", type=int, default=64, help="Batch size for inference.")
-    parser.add_argument(
-        "-g",
-        "--ngram",
-        type=int,
-        nargs="+",
-        default=[1, 2, 3],
-        help="Specify n-gram orders to segment texts before AlignScore (e.g., -g 1 2 3 or -g 1).",
-    )
-    parser.add_argument(
-        "--diff-only",
-        action="store_true",
-        help="If set, computes the average AlignScore ONLY over modified n-gram chunks (ignoring unchanged background text).",
-    )
+    parser.add_argument("-g", "--ngram", type=int, default=1, help="Specify a single n-gram order to evaluate (e.g., -g 1, -g 2, or -g 3).")
+    parser.add_argument("--diff-only", action="store_true", help="If set, computes score ONLY over modified n-gram chunks.")
     return parser.parse_args()
 
 
@@ -416,6 +378,6 @@ if __name__ == "__main__":
         ckpt_path=args.ckpt,
         model_name=args.model,
         batch_size=args.batch_size,
-        ngram_orders=args.ngram,
+        ngram_order=args.ngram,
         diff_only=args.diff_only,
     )
