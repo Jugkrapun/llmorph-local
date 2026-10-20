@@ -2,429 +2,311 @@ import argparse
 import csv
 import json
 import os
+import re
 from datetime import datetime
 from difflib import SequenceMatcher
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
-import spacy
+import torch
+from sentence_transformers import SentenceTransformer, util
 
 
-class Tokenizer:
-    """Wraps spaCy for tokenization and per-shot token-length scanning."""
+def tokenize(text: str) -> List[str]:
+    """Tokenizes input text into a list of words using regular expressions."""
+    return re.findall(r"\w+", text)
 
-    def __init__(self, spacy_model: str = "en_core_web_md"):
-        self.nlp = spacy.load(spacy_model, disable=["parser", "ner", "tagger"])
 
-    def tokenize(self, text: str) -> List[str]:
-        """Tokenizes text, converting to lowercase and stripping standalone punctuation/whitespace."""
-        doc = self.nlp(text)
-        return [
-            token.text.lower()
-            for token in doc
-            if not token.is_punct and not token.is_space
-        ]
+def get_ngram_strings(tokens: List[str], n: int) -> List[str]:
+    """Generates sliding-window n-gram strings of size n from a token list."""
+    if not tokens:
+        return []
+    if len(tokens) < n:
+        return [" ".join(tokens)]
+    return [" ".join(tokens[i : i + n]) for i in range(len(tokens) - n + 1)]
 
-    @staticmethod
-    def _extract_texts(item: dict) -> Tuple[str, Optional[str]]:
-        """Extracts source and followup texts from a dataset entry."""
+
+def pair_ngrams(src_ngrams: List[str], fol_ngrams: List[str]) -> List[Tuple[str, str]]:
+    """
+    Pairs source and followup n-grams using SequenceMatcher opcodes:
+    - 'equal': Ignored (no transformation).
+    - 'replace': Handled via direct 1:1 or proportional mapping.
+    - 'delete'/'insert': Handled via empty string mapping for strict penalization.
+    """
+    if not src_ngrams or not fol_ngrams:
+        return []
+
+    matcher = SequenceMatcher(None, src_ngrams, fol_ngrams)
+    pairs = []
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            continue
+        elif tag == 'replace':
+            s_range = list(range(i1, i2))
+            f_range = list(range(j1, j2))
+            max_len = max(len(s_range), len(f_range))
+            for i in range(max_len):
+                s_idx = s_range[min(i, len(s_range) - 1)]
+                f_idx = f_range[min(i, len(f_range) - 1)]
+                pairs.append((src_ngrams[s_idx], fol_ngrams[f_idx]))
+        elif tag == 'delete':
+            for s_idx in range(i1, i2):
+                pairs.append((src_ngrams[s_idx], ""))
+        elif tag == 'insert':
+            for f_idx in range(j1, j2):
+                pairs.append(("", fol_ngrams[f_idx]))
+
+    return pairs
+
+
+def resolve_mode_by_relation(relation_name: str) -> Tuple[str, float]:
+    """Automatically infers the evaluation mode and threshold based on relation ID."""
+    rel_str = str(relation_name).strip()
+    if rel_str == "8":
+        return "Synonym", 0.5   # Synonym threshold: > 0.5 = PASS
+    elif rel_str == "10":
+        return "Antonym", -0.5  # Antonym threshold: < -0.5 = PASS
+    else:
+        print(f"[Warning] Unknown relation_name '{rel_str}', defaulting to Synonym (> 0.5)")
+        return "Synonym", 0.5
+
+
+def evaluate_chunks_cosine(
+    file_path: str,
+    model_name: str = "all-MiniLM-L6-v2",
+    batch_size: int = 64,
+    ngram_order: int = 1,
+) -> None:
+    """
+    Extracts all changed/inserted/deleted n-gram chunks across the dataset,
+    evaluates them via Sentence Transformers Cosine Similarity, and computes pass percentage.
+    """
+    # Verify file existence
+    if not os.path.exists(file_path):
+        print(f"[Error] JSON file not found at: '{file_path}'")
+        return
+
+    # Load dataset JSON file
+    with open(file_path, "r", encoding="utf-8") as f:
+        json_obj = json.load(f)
+
+    data_entries = json_obj.get("data", [])
+    if not data_entries:
+        print("[Error] No entries found in the JSON 'data' field.")
+        return
+
+    llm_name = json_obj.get("llm_name", "unknown_model")
+    task_name = json_obj.get("task_name", "question_answering")
+    relation_name = str(json_obj.get("relation_name", "N/A"))
+    mode, threshold = resolve_mode_by_relation(relation_name)
+
+    all_extracted_chunks = []
+
+    # Iterate through dataset entries to extract chunk modifications
+    for idx, item in enumerate(data_entries):
+        shot_id = item.get("id", idx)
         src_input = item.get("source_input", [])
         src_text = " ".join(src_input) if isinstance(src_input, list) else str(src_input)
 
         followup_list = item.get("followup_inputs", [])
         if not followup_list or not followup_list[0]:
-            return src_text, None
-
+            continue
         fol_target = followup_list[0]
         fol_text = " ".join(fol_target) if isinstance(fol_target, list) else str(fol_target)
-        return src_text, fol_text
 
-    def scan_token_lengths(self, data_entries: List[dict]) -> Dict[int, bool]:
-        """Scans dataset to route shots to standard sliding or anchor alignment based on token lengths."""
-        equality_map: Dict[int, bool] = {}
-        mismatched_count = 0
+        src_tokens = tokenize(src_text)
+        fol_tokens = tokenize(fol_text)
+        src_ng = get_ngram_strings(src_tokens, ngram_order)
+        fol_ng = get_ngram_strings(fol_tokens, ngram_order)
 
-        print("\n--- Running Dataset Token Length Scan ---")
-        for shot_idx, item in enumerate(data_entries):
-            shot_id = item.get("id", shot_idx)
-            src_text, fol_text = self._extract_texts(item)
-            if fol_text is None:
+        pairs = pair_ngrams(src_ng, fol_ng)
+        for s_chunk, f_chunk in pairs:
+            # Skip empty strings or identical text cases (case-insensitive)
+            if s_chunk.strip() and f_chunk.strip() and s_chunk.lower() == f_chunk.lower():
                 continue
+            all_extracted_chunks.append({
+                "shot_id": shot_id,
+                "source_chunk": s_chunk,
+                "transformed_chunk": f_chunk
+            })
 
-            len_src = len(self.tokenize(src_text))
-            len_fol = len(self.tokenize(fol_text))
+    if not all_extracted_chunks:
+        print("[Error] No modified n-gram chunks found for evaluation.")
+        return
 
-            if len_src == len_fol:
-                equality_map[shot_id] = True
-            else:
-                equality_map[shot_id] = False
-                mismatched_count += 1
+    print(f"\n[Info] Found a total of {len(all_extracted_chunks):,} evaluated chunks.")
 
-        print(
-            f"[Scan Summary] Equal length shots: {len(data_entries) - mismatched_count} "
-            f"| Mismatched shots: {mismatched_count}"
-        )
-        return equality_map
+    # Deduplicate unique pairs of chunks for efficient batch inference
+    unique_pairs = list(set((c["source_chunk"], c["transformed_chunk"]) for c in all_extracted_chunks))
+    print(f"[Init] Deduplicated to {len(unique_pairs):,} unique chunk pairs for batch inference.")
 
+    # Initialize computation device and load SentenceTransformer model
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[Init] Loading SentenceTransformer ({model_name}) on {device}...")
+    model = SentenceTransformer(model_name, device=device)
 
-class NgramExtractor:
-    """Extracts position-aligned n-gram pairs for changed tokens."""
+    print(f"[Run] Computing Cosine Similarity for unique chunk pairs...")
+    
+    pair_score_lookup = {}
+    valid_pairs = []
 
-    @staticmethod
-    def extract_standard_sliding_ngrams(
-        tokens1: List[str], tokens2: List[str], n: int
-    ) -> List[Tuple[int, str, str]]:
-        """Builds standard positional sliding window pairs for equal-length token lists."""
-        pairs = []
-        if n == 1:
-            ngrams1 = [[t] for t in tokens1]
-            ngrams2 = [[t] for t in tokens2]
+    # Filter out empty strings before inference
+    for pair in unique_pairs:
+        s_c, f_c = pair
+        if not s_c.strip() or not f_c.strip():
+            pair_score_lookup[pair] = 0.0
         else:
-            ngrams1 = [tokens1[i : i + n] for i in range(len(tokens1) - n + 1)] if len(tokens1) >= n else [tokens1]
-            ngrams2 = [tokens2[i : i + n] for i in range(len(tokens2) - n + 1)] if len(tokens2) >= n else [tokens2]
+            valid_pairs.append(pair)
 
-        min_len = min(len(ngrams1), len(ngrams2))
-        for pos_idx in range(min_len):
-            span1 = " ".join(ngrams1[pos_idx]).strip()
-            span2 = " ".join(ngrams2[pos_idx]).strip()
+    if valid_pairs:
+        batch_src = [p[0] for p in valid_pairs]
+        batch_fol = [p[1] for p in valid_pairs]
+        
+        # Batch encode sentences and compute cosine similarity diagonal matrix
+        emb_src = model.encode(batch_src, batch_size=batch_size, convert_to_tensor=True, show_progress_bar=False)
+        emb_fol = model.encode(batch_fol, batch_size=batch_size, convert_to_tensor=True, show_progress_bar=False)
+        raw_scores = util.cos_sim(emb_src, emb_fol).diagonal().cpu().tolist()
 
-            if span1 and span2 and span1 != span2:
-                pairs.append((pos_idx, span1, span2))
+        for pair, sc in zip(valid_pairs, raw_scores):
+            pair_score_lookup[pair] = float(sc)
 
-        return pairs
+    passed_chunks_count = 0
+    records = []
 
-    @staticmethod
-    def _build_alignment_map(tokens1: List[str], tokens2: List[str]) -> List[int]:
-        """Maps tokens1 indices to corresponding tokens2 indices using SequenceMatcher opcodes."""
-        matcher = SequenceMatcher(None, tokens1, tokens2)
-        map_j: List[Optional[int]] = [None] * len(tokens1)
+    # Evaluate each record against the established threshold
+    for item in all_extracted_chunks:
+        s_chunk = item["source_chunk"]
+        f_chunk = item["transformed_chunk"]
+        score_val = pair_score_lookup.get((s_chunk, f_chunk), 0.0)
 
-        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-            if tag == "equal":
-                for k in range(i2 - i1):
-                    map_j[i1 + k] = j1 + k
-            elif tag == "replace":
-                len1, len2 = i2 - i1, j2 - j1
-                for k in range(len1):
-                    map_j[i1 + k] = j1 + min(k, max(len2 - 1, 0))
-            elif tag == "delete":
-                for k in range(i2 - i1):
-                    map_j[i1 + k] = min(j1, max(len(tokens2) - 1, 0))
-
-        for i in range(len(map_j)):
-            if map_j[i] is None:
-                map_j[i] = min(i, max(len(tokens2) - 1, 0))
-
-        return map_j  # type: ignore[return-value]
-
-    def extract_anchor_aligned_ngrams(
-        self, tokens1: List[str], tokens2: List[str], n: int
-    ) -> List[Tuple[int, str, str]]:
-        """Builds anchor-aligned n-gram pairs for mismatched sequence lengths to prevent index shift."""
-        if not tokens1:
-            return []
-
-        map_j = self._build_alignment_map(tokens1, tokens2)
-        len1 = len(tokens1)
-        window1 = (
-            [tokens1[i : i + n] for i in range(len1 - n + 1)]
-            if len1 >= n
-            else [tokens1]
-        )
-
-        pairs = []
-        for pos_idx, w1 in enumerate(window1):
-            j_start = map_j[pos_idx] if pos_idx < len(map_j) else None
-            if j_start is None or not tokens2:
-                continue
-            j_start = max(0, min(j_start, len(tokens2) - 1))
-            w2 = tokens2[j_start : j_start + n]
-            if len(w2) < n:
-                w2 = tokens2[max(0, len(tokens2) - n):]
-
-            span1 = " ".join(w1).strip()
-            span2 = " ".join(w2).strip()
-            if span1 and span2 and span1 != span2:
-                pairs.append((pos_idx, span1, span2))
-
-        return pairs
-
-
-class SimilarityScorer:
-    """Computes cosine similarity for word pairs using static word vectors."""
-
-    def __init__(self, nlp):
-        self.nlp = nlp
-
-    def check_cosine(self, word_orig: str, word_trans: str, mode: str) -> float:
-        """Calculates vector cosine similarity, adjusting polarity for antonyms."""
-        doc1 = self.nlp(word_orig)
-        doc2 = self.nlp(word_trans)
-
-        if doc1.has_vector and doc2.has_vector and doc1.vector_norm and doc2.vector_norm:
-            cosine = float(doc1.similarity(doc2))
+        # Check conditions based on mode: Synonym (> threshold) or Antonym (< threshold)
+        if mode == "Synonym":
+            is_pass = score_val > threshold
         else:
-            cosine = 0.0
+            is_pass = score_val < threshold
 
-        return -cosine if mode == "Antonym" else cosine
+        if is_pass:
+            passed_chunks_count += 1
 
+        records.append({
+            "shot_id": item["shot_id"],
+            "status": "PASS" if is_pass else "FAIL",
+            "cosine_similarity": round(score_val, 4),
+            "source_chunk": s_chunk,
+            "transformed_chunk": f_chunk
+        })
 
-class DatasetEvaluator:
-    """Evaluates transformation precision across dataset shots for a specific n-gram level."""
+    total_chunks = len(records)
+    pass_percentage = (passed_chunks_count / total_chunks * 100.0) if total_chunks > 0 else 0.0
 
-    def __init__(self, tokenizer: Tokenizer, extractor: NgramExtractor, scorer: SimilarityScorer):
-        self.tokenizer = tokenizer
-        self.extractor = extractor
-        self.scorer = scorer
+    # Print summary output to console
+    print("\n================ CHUNK-LEVEL COSINE SIMILARITY RESULTS ================")
+    print(f"Model Evaluated:          {llm_name}")
+    print(f"Task:                     {task_name} (Relation {relation_name})")
+    print(f"Mode:                     {mode} (Threshold: {threshold})")
+    print(f"N-gram Order Evaluated:   {ngram_order}-gram")
+    print(f"Total Evaluated Chunks:   {total_chunks:,}")
+    print(f"Passed Chunks:            {passed_chunks_count:,}")
+    print(f"Pass Percentage:          {pass_percentage:.2f}%")
+    print("========================================================================")
 
-    def evaluate(
-        self,
-        data_entries: List[dict],
-        equality_map: Dict[int, bool],
-        gram_level: int,
-        mode: str,
-        threshold: float = 0.8,
-    ) -> Dict[str, Any]:
-        all_map_records = []
-        total_map_elements = 0
-        passed_threshold_count = 0
+    # Automatically structure output directory path: logs/{Mode}/{ProjectName}/cosine
+    abs_path = os.path.abspath(file_path)
+    path_parts = abs_path.split(os.sep)
+    project_folder = "llm-nlpaug"
+    for part in path_parts:
+        if "nlpaug" in part or "transform" in part or "dataset" in part:
+            project_folder = part
+            break
+    else:
+        if len(path_parts) >= 3:
+            project_folder = path_parts[-3]
 
-        print(f"\nProcessing {len(data_entries)} shots ({gram_level}-Gram)...")
+    output_dir = os.path.join("logs", mode.capitalize(), project_folder, "cosine")
+    os.makedirs(output_dir, exist_ok=True)
+    date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-        for shot_idx, item in enumerate(data_entries):
-            shot_id = item.get("id", shot_idx)
-            src_text, fol_text = self.tokenizer._extract_texts(item)
-            if fol_text is None:
-                continue
+    # Export results to CSV file
+    csv_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram.csv"
+    csv_path = os.path.join(output_dir, csv_filename)
 
-            tokens_src = self.tokenizer.tokenize(src_text)
-            tokens_fol = self.tokenizer.tokenize(fol_text)
-
-            is_equal = equality_map.get(shot_id, True)
-            if is_equal:
-                mapping = self.extractor.extract_standard_sliding_ngrams(tokens_src, tokens_fol, gram_level)
-                method_used = "Standard Sliding"
-            else:
-                mapping = self.extractor.extract_anchor_aligned_ngrams(tokens_src, tokens_fol, gram_level)
-                method_used = "Anchor Alignment"
-
-            for pos_idx, word_orig, word_trans in mapping:
-                cosine_score = self.scorer.check_cosine(word_orig, word_trans, mode)
-
-                is_valid = (cosine_score >= threshold) if mode == "Synonym" else (cosine_score <= threshold)
-
-                if is_valid:
-                    passed_threshold_count += 1
-                total_map_elements += 1
-
-                all_map_records.append({
-                    "shot_id": shot_id,
-                    "word_pos": pos_idx,
-                    "method": method_used,
-                    "original": word_orig,
-                    "transformed": word_trans,
-                    "cosine_similarity": round(cosine_score, 4),
-                    "pass_threshold": is_valid,
-                })
-
-        precision = (passed_threshold_count / total_map_elements) if total_map_elements > 0 else 0.0
-
-        return {
-            "total_shots": len(data_entries),
-            "total_map": total_map_elements,
-            "passed_threshold": passed_threshold_count,
-            "precision": precision,
-            "metrics": all_map_records,
-        }
-
-
-class ResultExporter:
-    """Exports results to sequential CSV and formatted text log files."""
-
-    @staticmethod
-    def export_csv(
-        metric_list: List[dict],
-        mode: str,
-        output_dir: str,
-        llm_name: str,
-        relation_name: str,
-        gram_level: int,
-        date_time_str: str,
-    ) -> None:
-        """Saves metric details to a formatted CSV file."""
-        metric_list.sort(key=lambda x: (int(x["shot_id"]), int(x["word_pos"])))
-
-        csv_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_time_str}_{gram_level}gram_sequential.csv"
-        csv_path = os.path.join(output_dir, csv_filename)
-
-        with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f, quoting=csv.QUOTE_ALL)
+    with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, quoting=csv.QUOTE_ALL)
+        writer.writerow(["Shot_ID", "Status", "Cosine_Similarity", "Source_Chunk", "Transformed_Chunk"])
+        for r in records:
             writer.writerow([
-                "Shot_ID",
-                "Position",
-                "Status",
-                "Original_NGram",
-                "Transformed_NGram",
-                "Cosine_Similarity",
+                f"#{r['shot_id']}",
+                r["status"],
+                f"{r['cosine_similarity']:.4f}",
+                r["source_chunk"],
+                r["transformed_chunk"],
             ])
-            for item in metric_list:
-                status_text = "PASS" if item["pass_threshold"] else "FAIL"
-                writer.writerow([
-                    f"#{item['shot_id']}",
-                    item["word_pos"],
-                    status_text,
-                    item["original"],
-                    item["transformed"],
-                    f"{item['cosine_similarity']:.4f}",
-                ])
+    print(f"[Saved] CSV results saved to: '{csv_path}'")
 
-        print(f"[Saved] CSV saved to: '{csv_path}'")
+    # Export summary log to TXT file
+    log_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram_summary.txt"
+    log_path = os.path.join(output_dir, log_filename)
 
-    @staticmethod
-    def save_summary_log(
-        summary_res: dict,
-        mode: str,
-        gram_level: int,
-        threshold: float,
-        llm_name: str,
-        task_name: str,
-        relation_name: str,
-        output_dir: str,
-        date_str: str,
-    ) -> None:
-        """Saves evaluation summary directly to a structured text log file."""
-        log_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{gram_level}gram_summary.txt"
-        log_path = os.path.join(output_dir, log_filename)
+    summary_lines = [
+        "=" * 60,
+        f"        CHUNK-LEVEL {ngram_order}-GRAM COSINE SIMILARITY SUMMARY",
+        "=" * 60,
+        f"Timestamp:                 {date_str}",
+        f"Model Evaluated:           {llm_name}",
+        f"Task Name:                 {task_name}",
+        f"Relation ID:               {relation_name}",
+        f"Evaluation Mode:           {mode}",
+        f"Score Threshold:           {threshold}",
+        f"N-gram Order:              {ngram_order}",
+        "-" * 60,
+        f"Total Evaluated Chunks:    {total_chunks:,}",
+        f"Passed Chunks:             {passed_chunks_count:,}",
+        f"Pass Percentage:           {pass_percentage:.2f}%",
+        "=" * 60,
+    ]
 
-        lines = [
-            "=" * 60,
-            f"          EVALUATION SUMMARY LOG ({gram_level}-GRAM)",
-            "=" * 60,
-            f"Timestamp:                 {date_str}",
-            f"Model Evaluated:           {llm_name}",
-            f"Task Name:                 {task_name}",
-            f"Relation ID:               {relation_name}",
-            f"Evaluation Mode:           {mode}",
-            f"Similarity Threshold:      {threshold}",
-            f"Method:                    Static Vector Check (spaCy)",
-            "-" * 60,
-            f"Total Evaluated Shots:     {summary_res['total_shots']:,}",
-            f"Total Changed (|map|):     {summary_res['total_map']:,}",
-            f"Passed Threshold:          {summary_res['passed_threshold']:,}",
-            f"Computed Precision:        {summary_res['precision'] * 100:.2f}%",
-            "=" * 60,
-        ]
+    with open(log_path, mode="w", encoding="utf-8") as f:
+        f.write("\n".join(summary_lines) + "\n")
+    print(f"[Saved] Summary log saved to: '{log_path}'")
 
-        with open(log_path, mode="w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
+    # Export structured results to JSON file
+    json_filename = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram.json"
+    json_path = os.path.join(output_dir, json_filename)
 
-        print(f"[Saved] Summary log saved to: '{log_path}'")
+    json_output = {
+        "timestamp": date_str,
+        "model_evaluated": llm_name,
+        "task_name": task_name,
+        "relation_name": relation_name,
+        "evaluation_mode": mode,
+        "score_threshold": threshold,
+        "ngram_order": ngram_order,
+        "total_chunks": total_chunks,
+        "passed_chunks": passed_chunks_count,
+        "pass_percentage": round(pass_percentage, 2),
+        "records": records,
+    }
 
-
-class EvaluationPipeline:
-    """Orchestrates the entire evaluation workflow."""
-
-    def __init__(self, spacy_model: str = "en_core_web_md"):
-        self.tokenizer = Tokenizer(spacy_model)
-        self.extractor = NgramExtractor()
-        self.scorer = SimilarityScorer(self.tokenizer.nlp)
-        self.evaluator = DatasetEvaluator(self.tokenizer, self.extractor, self.scorer)
-        self.exporter = ResultExporter()
-
-    @staticmethod
-    def _parse_gram_levels(gram_input: Optional[str]) -> List[int]:
-        """Parses comma-separated n-gram levels from args or manual input."""
-        if not gram_input:
-            gram_input = input("\nEnter N-Gram levels to run, comma-separated (e.g., 1,2,3): ").strip()
-        try:
-            gram_levels = sorted(set(int(g.strip()) for g in gram_input.split(",") if g.strip()))
-            return [g for g in gram_levels if g >= 1] or [1, 2, 3]
-        except ValueError:
-            return [1, 2, 3]
-
-    @staticmethod
-    def _resolve_mode_by_relation(relation_name: str) -> Tuple[str, float]:
-        """Automatically infers mode and threshold based on relation_name from the JSON file."""
-        rel_str = str(relation_name).strip()
-        if rel_str == "8":
-            return "Synonym", 0.8
-        elif rel_str == "10":
-            return "Antonym", -0.8
-        else:
-            print(f"[Warning] Unknown relation_name '{rel_str}', defaulting to Synonym (>= 0.8)")
-            return "Synonym", 0.8
-
-    def run(self, file_path: Optional[str] = None, grams_arg: Optional[str] = None) -> None:
-        if not file_path:
-            file_path = input("Enter JSON file path: ").strip()
-
-        if not os.path.exists(file_path):
-            print(f"[Error] File not found: '{file_path}'")
-            return
-
-        with open(file_path, "r", encoding="utf-8") as f:
-            json_obj = json.load(f)
-
-        data_entries = json_obj.get("data", [])
-        if not data_entries:
-            print("[Error] No entries found in JSON 'data' field.")
-            return
-
-        relation_name = json_obj.get("relation_name", "N/A")
-        mode, threshold = self._resolve_mode_by_relation(relation_name)
-        print(f"\n[Auto Mode Detection] Detected relation_name: '{relation_name}' -> Mode: {mode} (Threshold: {threshold})")
-
-        equality_map = self.tokenizer.scan_token_lengths(data_entries)
-        gram_levels = self._parse_gram_levels(grams_arg)
-
-        llm_name = json_obj.get("llm_name", "unknown_model")
-        task_name = json_obj.get("task_name", "question_answering")
-        date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
-        for gram_level in gram_levels:
-            results = self.evaluator.evaluate(data_entries, equality_map, gram_level, mode, threshold)
-
-            print(f"\n================ EVALUATION RESULTS ({gram_level}-GRAM) ================")
-            print(f"Model:                    {llm_name}")
-            print(f"Task:                     {task_name} (Relation {relation_name})")
-            print(f"Mode:                     {mode} (Threshold: {threshold})")
-            print(f"Total Shots:              {results['total_shots']}")
-            print(f"Total Changed (|map|):    {results['total_map']}")
-            print(f"Passed Threshold:         {results['passed_threshold']}")
-            print(f"Precision:                {results['precision'] * 100:.2f}%")
-            print("========================================================================")
-
-            output_dir = os.path.join("logs", mode.capitalize(), f"log-{gram_level}gram")
-            os.makedirs(output_dir, exist_ok=True)
-
-            if results["metrics"]:
-                self.exporter.export_csv(
-                    results["metrics"], mode, output_dir, llm_name, relation_name, gram_level, date_str
-                )
-
-            self.exporter.save_summary_log(
-                results, mode, gram_level, threshold, llm_name, task_name, relation_name, output_dir, date_str
-            )
+    with open(json_path, mode="w", encoding="utf-8") as f:
+        json.dump(json_output, f, ensure_ascii=False, indent=4)
+    print(f"[Saved] JSON log saved to: '{json_path}'")
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate positional n-gram word substitution semantic consistency.")
-    parser.add_argument(
-        "-p",
-        "--path",
-        type=str,
-        default=None,
-        help="Path to the evaluated test result JSON file.",
-    )
-    parser.add_argument(
-        "-g",
-        "--grams",
-        type=str,
-        default=None,
-        help="Comma-separated n-gram levels (e.g. '1,2,3'). If omitted, defaults or prompts interactively.",
-    )
+    """Parses command-line arguments for evaluation configuration."""
+    parser = argparse.ArgumentParser(description="Evaluate chunks using Sentence Transformers Cosine Similarity.")
+    parser.add_argument("-p", "--path", type=str, required=True, help="Path to the evaluated test result JSON file.")
+    parser.add_argument("-m", "--model", type=str, default="all-MiniLM-L6-v2", help="Sentence Transformer model name.")
+    parser.add_argument("-b", "--batch_size", type=int, default=64, help="Batch size for inference.")
+    parser.add_argument("-g", "--ngram", type=int, default=1, help="Specify n-gram order (e.g., -g 1, -g 2).")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_arguments()
-    EvaluationPipeline().run(file_path=args.path, grams_arg=args.grams)
+    evaluate_chunks_cosine(
+        file_path=args.path,
+        model_name=args.model,
+        batch_size=args.batch_size,
+        ngram_order=args.ngram,
+    )
