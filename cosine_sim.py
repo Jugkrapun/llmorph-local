@@ -101,6 +101,7 @@ def resolve_mode_by_relation(relation_name: str) -> Tuple[str, float]:
 
 def evaluate_hybrid_cosine(
     file_path: str,
+    output_base: str = None,
     model_name: str = "all-MiniLM-L6-v2",
     batch_size: int = 64,
     ngram_order: int = 1,
@@ -157,7 +158,7 @@ def evaluate_hybrid_cosine(
                     continue
                 all_evaluated_items.append({
                     "shot_id": shot_id,
-                    "reference_chunk": s_chunk,      # Compare directly with source
+                    "reference_chunk": s_chunk,
                     "transformed_chunk": f_chunk,
                     "display_source": s_chunk
                 })
@@ -168,7 +169,7 @@ def evaluate_hybrid_cosine(
                     continue
                 all_evaluated_items.append({
                     "shot_id": shot_id,
-                    "reference_chunk": wordnet_ant,  # Compare with WordNet Antonym (source')[cite: 1]
+                    "reference_chunk": wordnet_ant,
                     "transformed_chunk": f_chunk,
                     "display_source": s_chunk,
                     "wordnet_antonym": wordnet_ant
@@ -251,26 +252,30 @@ def evaluate_hybrid_cosine(
     print(f"Pass Percentage:          {pass_percentage:.2f}%")
     print("====================================================================")
 
-    # Output directory structure: logs/{Mode}/{ProjectName}/cosine_chunks_{ngram}gram
-    abs_path = os.path.abspath(file_path)
-    path_parts = abs_path.split(os.sep)
-    project_folder = "llm-nlpaug"
-    for part in path_parts:
-        if "nlpaug" in part or "transform" in part or "dataset" in part:
-            project_folder = part
-            break
+    # Resolve output directory base name (from user argument -o or auto-extracted from path)
+    if output_base:
+        project_folder = output_base.strip()
     else:
-        if len(path_parts) >= 3:
-            project_folder = path_parts[-3]
+        abs_path = os.path.abspath(file_path)
+        path_parts = abs_path.split(os.sep)
+        project_folder = "llm-nlpaug"
+        for part in path_parts:
+            if "nlpaug" in part or "transform" in part or "dataset" in part:
+                project_folder = part
+                break
+        else:
+            if len(path_parts) >= 3:
+                project_folder = path_parts[-3]
 
-    output_dir = os.path.join("logs", mode.capitalize(), project_folder, f"cosine_chunks_{ngram_order}gram")
+    # Structure format: logs/{Synonym or Antonym}/{output_name}-{ngram}gram
+    output_dir = os.path.join("logs", mode.capitalize(), f"{project_folder}-{ngram_order}gram")
     os.makedirs(output_dir, exist_ok=True)
     date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     file_prefix = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram"
 
     # Export CSV
-    csv_path = os.path.join(output_dir, f"{file_prefix}_chunks.csv")
+    csv_path = os.path.join(output_dir, f"{file_prefix}.csv")
     with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, quoting=csv.QUOTE_ALL)
         if mode == "Antonym":
@@ -284,7 +289,7 @@ def evaluate_hybrid_cosine(
     print(f"[Saved] CSV results saved to: '{csv_path}'")
 
     # Export JSON
-    json_path = os.path.join(output_dir, f"{file_prefix}_chunks.json")
+    json_path = os.path.join(output_dir, f"{file_prefix}.json")
     with open(json_path, mode="w", encoding="utf-8") as f:
         json.dump({
             "timestamp": date_str,
@@ -302,7 +307,7 @@ def evaluate_hybrid_cosine(
     print(f"[Saved] JSON log saved to: '{json_path}'")
 
     # Export TXT summary
-    log_path = os.path.join(output_dir, f"{file_prefix}_chunks_summary.txt")
+    log_path = os.path.join(output_dir, f"{file_prefix}_summary.txt")
     summary_lines = [
         "=" * 60,
         f"        HYBRID COSINE SIMILARITY SUMMARY ({mode.upper()})",
@@ -328,6 +333,7 @@ def evaluate_hybrid_cosine(
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Hybrid evaluation script supporting Synonym and WordNet-backed Antonym cosine similarity.")
     parser.add_argument("-p", "--path", type=str, required=True, help="Path to evaluated test result JSON file.")
+    parser.add_argument("-o", "--output", type=str, default=None, help="Custom output folder base name (e.g., -o llmorph-keybert-nlpaug).")
     parser.add_argument("-m", "--model", type=str, default="all-MiniLM-L6-v2", help="Sentence Transformer model name.")
     parser.add_argument("-b", "--batch_size", type=int, default=64, help="Batch size for inference.")
     parser.add_argument("-g", "--ngram", type=int, default=1, help="Specify n-gram order (e.g., -g 1, -g 2).")
@@ -338,6 +344,7 @@ if __name__ == "__main__":
     args = parse_arguments()
     evaluate_hybrid_cosine(
         file_path=args.path,
+        output_base=args.output,
         model_name=args.model,
         batch_size=args.batch_size,
         ngram_order=args.ngram,
