@@ -7,20 +7,8 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Dict, List, Tuple
 
-import nltk
 import torch
-from nltk.corpus import wordnet
 from sentence_transformers import SentenceTransformer, util
-
-
-def ensure_wordnet_data() -> None:
-    """Downloads NLTK WordNet resources if not already present."""
-    for resource in ("corpora/wordnet", "corpora/omw-1.4"):
-        try:
-            nltk.data.find(resource)
-        except LookupError:
-            package = resource.split("/")[-1]
-            nltk.download(package, quiet=True)
 
 
 def tokenize(text: str) -> List[str]:
@@ -35,22 +23,6 @@ def get_ngram_strings(tokens: List[str], n: int) -> List[str]:
     if len(tokens) < n:
         return [" ".join(tokens)]
     return [" ".join(tokens[i : i + n]) for i in range(len(tokens) - n + 1)]
-
-
-def get_wordnet_antonym(word: str) -> str:
-    """
-    Looks up WordNet to find a true linguistic antonym for a given word chunk.
-    Returns the antonym if found, otherwise returns an empty string.
-    """
-    antonyms = set()
-    clean_word = word.strip().lower()
-    for syn in wordnet.synsets(clean_word):
-        for lemma in syn.lemmas():
-            for ant in lemma.antonyms():
-                antonyms.add(ant.name().replace('_', ' '))
-    if antonyms:
-        return list(antonyms)[0]
-    return ""
 
 
 def pair_ngrams(src_ngrams: List[str], fol_ngrams: List[str]) -> List[Tuple[str, str]]:
@@ -91,9 +63,9 @@ def resolve_mode_by_relation(relation_name: str) -> Tuple[str, float]:
     """Automatically infers the evaluation mode and threshold based on relation ID."""
     rel_str = str(relation_name).strip()
     if rel_str == "8":
-        return "Synonym", 0.5   # Synonym threshold: > 0.5 = PASS[cite: 1]
+        return "Synonym", 0.5   # Synonym threshold: > 0.5 = PASS
     elif rel_str == "10":
-        return "Antonym", 0.5   # Antonym threshold (vs WordNet Antonym): > 0.5 = PASS[cite: 1]
+        return "Antonym", -0.5  # Antonym threshold: < -0.5 = PASS
     else:
         print(f"[Warning] Unknown relation_name '{rel_str}', defaulting to Synonym (> 0.5)")
         return "Synonym", 0.5
@@ -108,14 +80,12 @@ def evaluate_hybrid_cosine(
 ) -> None:
     """
     Evaluates dataset chunks using Sentence Transformers Cosine Similarity:
-    - Synonym: Cosine(Source Chunk, Transformed Chunk) > 0.5[cite: 1]
-    - Antonym: Cosine(WordNet Antonym of Source Chunk, Transformed Chunk) > 0.5[cite: 1]
+    - Synonym: Cosine(Source Chunk, Transformed Chunk) > 0.5
+    - Antonym: Cosine(Source Chunk, Transformed Chunk) < -0.5
     """
     if not os.path.exists(file_path):
         print(f"[Error] JSON file not found at: '{file_path}'")
         return
-
-    ensure_wordnet_data()
 
     with open(file_path, "r", encoding="utf-8") as f:
         json_obj = json.load(f)
@@ -156,24 +126,13 @@ def evaluate_hybrid_cosine(
             if mode == "Synonym":
                 if s_chunk.lower() == f_chunk.lower():
                     continue
-                all_evaluated_items.append({
-                    "shot_id": shot_id,
-                    "reference_chunk": s_chunk,
-                    "transformed_chunk": f_chunk,
-                    "display_source": s_chunk
-                })
-            else:
-                # Antonym Mode: Look up WordNet antonym as ground truth reference (source')[cite: 1]
-                wordnet_ant = get_wordnet_antonym(s_chunk)
-                if not wordnet_ant:
-                    continue
-                all_evaluated_items.append({
-                    "shot_id": shot_id,
-                    "reference_chunk": wordnet_ant,
-                    "transformed_chunk": f_chunk,
-                    "display_source": s_chunk,
-                    "wordnet_antonym": wordnet_ant
-                })
+
+            all_evaluated_items.append({
+                "shot_id": shot_id,
+                "reference_chunk": s_chunk,
+                "transformed_chunk": f_chunk,
+                "display_source": s_chunk
+            })
 
     if not all_evaluated_items:
         print("[Error] No valid chunk pairs found for evaluation.")
@@ -220,8 +179,11 @@ def evaluate_hybrid_cosine(
         trans_c = item["transformed_chunk"]
         score_val = pair_score_lookup.get((ref_c, trans_c), 0.0)
 
-        # Threshold condition: > 0.5 = PASS for both modes[cite: 1]
-        is_pass = score_val > threshold
+        # Threshold condition: Synonym > 0.5, Antonym < -0.5
+        if mode == "Synonym":
+            is_pass = score_val > threshold
+        else:
+            is_pass = score_val < threshold
 
         if is_pass:
             passed_chunks_count += 1
@@ -233,8 +195,6 @@ def evaluate_hybrid_cosine(
             "source_chunk": item["display_source"],
             "transformed_chunk": trans_c
         }
-        if mode == "Antonym":
-            record_entry["wordnet_antonym"] = item["wordnet_antonym"]
 
         records.append(record_entry)
 
@@ -245,7 +205,7 @@ def evaluate_hybrid_cosine(
     print(f"Model Evaluated:          {llm_name}")
     print(f"Task:                     {task_name} (Relation {relation_name})")
     print(f"Evaluation Mode:          {mode}")
-    print(f"Threshold (>):            {threshold}")
+    print(f"Threshold:                {threshold}")
     print(f"N-gram Order Evaluated:   {ngram_order}-gram")
     print(f"Total Evaluated Chunks:   {total_chunks:,}")
     print(f"Passed Chunks:            {passed_chunks_count:,}")
@@ -278,14 +238,9 @@ def evaluate_hybrid_cosine(
     csv_path = os.path.join(output_dir, f"{file_prefix}.csv")
     with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, quoting=csv.QUOTE_ALL)
-        if mode == "Antonym":
-            writer.writerow(["Shot_ID", "Status", "Cosine_Similarity", "Source_Chunk", "WordNet_Antonym", "Transformed_Chunk"])
-            for r in records:
-                writer.writerow([f"#{r['shot_id']}", r["status"], f"{r['cosine_similarity']:.4f}", r["source_chunk"], r["wordnet_antonym"], r["transformed_chunk"]])
-        else:
-            writer.writerow(["Shot_ID", "Status", "Cosine_Similarity", "Source_Chunk", "Transformed_Chunk"])
-            for r in records:
-                writer.writerow([f"#{r['shot_id']}", r["status"], f"{r['cosine_similarity']:.4f}", r["source_chunk"], r["transformed_chunk"]])
+        writer.writerow(["Shot_ID", "Status", "Cosine_Similarity", "Source_Chunk", "Transformed_Chunk"])
+        for r in records:
+            writer.writerow([f"#{r['shot_id']}", r["status"], f"{r['cosine_similarity']:.4f}", r["source_chunk"], r["transformed_chunk"]])
     print(f"[Saved] CSV results saved to: '{csv_path}'")
 
     # Export JSON
@@ -331,7 +286,7 @@ def evaluate_hybrid_cosine(
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Hybrid evaluation script supporting Synonym and WordNet-backed Antonym cosine similarity.")
+    parser = argparse.ArgumentParser(description="Evaluation script supporting Synonym and Antonym cosine similarity.")
     parser.add_argument("-p", "--path", type=str, required=True, help="Path to evaluated test result JSON file.")
     parser.add_argument("-o", "--output", type=str, default=None, help="Custom output folder base name (e.g., -o llmorph-keybert-nlpaug).")
     parser.add_argument("-m", "--model", type=str, default="all-MiniLM-L6-v2", help="Sentence Transformer model name.")
