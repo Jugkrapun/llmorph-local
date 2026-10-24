@@ -71,7 +71,7 @@ def resolve_mode_by_relation(relation_name: str) -> Tuple[str, float]:
         return "Synonym", 0.5
 
 
-def evaluate_hybrid_cosine(
+def evaluate_cosine(
     file_path: str,
     output_base: str = None,
     model_name: str = "all-MiniLM-L6-v2",
@@ -297,7 +297,7 @@ def parse_arguments() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_arguments()
-    evaluate_hybrid_cosine(
+    evaluate_cosine(
         file_path=args.path,
         output_base=args.output,
         model_name=args.model,
