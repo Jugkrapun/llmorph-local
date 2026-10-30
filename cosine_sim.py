@@ -59,16 +59,16 @@ def pair_ngrams(src_ngrams: List[str], fol_ngrams: List[str]) -> List[Tuple[str,
     return pairs
 
 
-def resolve_mode_by_relation(relation_name: str) -> Tuple[str, float]:
-    """Automatically infers the evaluation mode and threshold based on relation ID."""
+def resolve_mode_by_relation(relation_name: str) -> str:
+    """Automatically infers the evaluation mode based on relation ID."""
     rel_str = str(relation_name).strip()
     if rel_str == "8":
-        return "Synonym", 0.5   # Synonym threshold: > 0.5 = PASS
+        return "Synonym"
     elif rel_str == "10":
-        return "Antonym", -0.5  # Antonym threshold: < -0.5 = PASS
+        return "Antonym"
     else:
-        print(f"[Warning] Unknown relation_name '{rel_str}', defaulting to Synonym (> 0.5)")
-        return "Synonym", 0.5
+        print(f"[Warning] Unknown relation_name '{rel_str}', defaulting to Synonym")
+        return "Synonym"
 
 
 def evaluate_cosine(
@@ -80,8 +80,7 @@ def evaluate_cosine(
 ) -> None:
     """
     Evaluates dataset chunks using Sentence Transformers Cosine Similarity:
-    - Synonym: Cosine(Source Chunk, Transformed Chunk) > 0.5
-    - Antonym: Cosine(Source Chunk, Transformed Chunk) < -0.5
+    - Threshold is calculated dynamically as the average of all cosine similarity scores.
     """
     if not os.path.exists(file_path):
         print(f"[Error] JSON file not found at: '{file_path}'")
@@ -98,7 +97,8 @@ def evaluate_cosine(
     llm_name = json_obj.get("llm_name", "unknown_model")
     task_name = json_obj.get("task_name", "question_answering")
     relation_name = str(json_obj.get("relation_name", "N/A"))
-    mode, threshold = resolve_mode_by_relation(relation_name)
+    
+    mode = resolve_mode_by_relation(relation_name)
 
     all_evaluated_items = []
 
@@ -171,19 +171,25 @@ def evaluate_cosine(
         for pair, sc in zip(valid_pairs, raw_scores):
             pair_score_lookup[pair] = float(sc)
 
-    passed_chunks_count = 0
-    records = []
-
+    # Calculate Threshold from mean
+    all_scores = []
     for item in all_evaluated_items:
         ref_c = item["reference_chunk"]
         trans_c = item["transformed_chunk"]
-        score_val = pair_score_lookup.get((ref_c, trans_c), 0.0)
+        all_scores.append(pair_score_lookup.get((ref_c, trans_c), 0.0))
+        
+    dynamic_threshold = sum(all_scores) / len(all_scores) if all_scores else 0.0
+    print(f"[Info] Dynamic Threshold (Average Score) calculated as: {dynamic_threshold:.4f}")
 
-        # Threshold condition: Synonym > 0.5, Antonym < -0.5
+    passed_chunks_count = 0
+    records = []
+
+    for item, score_val in zip(all_evaluated_items, all_scores):
+        # Utilize Dynamic Threshold
         if mode == "Synonym":
-            is_pass = score_val > threshold
+            is_pass = score_val >= dynamic_threshold
         else:
-            is_pass = score_val < threshold
+            is_pass = score_val <= dynamic_threshold
 
         if is_pass:
             passed_chunks_count += 1
@@ -193,7 +199,7 @@ def evaluate_cosine(
             "status": "PASS" if is_pass else "FAIL",
             "cosine_similarity": round(score_val, 4),
             "source_chunk": item["display_source"],
-            "transformed_chunk": trans_c
+            "transformed_chunk": item["transformed_chunk"]
         }
 
         records.append(record_entry)
@@ -205,14 +211,13 @@ def evaluate_cosine(
     print(f"Model Evaluated:          {llm_name}")
     print(f"Task:                     {task_name} (Relation {relation_name})")
     print(f"Evaluation Mode:          {mode}")
-    print(f"Threshold:                {threshold}")
+    print(f"Avg Threshold:    {dynamic_threshold:.4f}")
     print(f"N-gram Order Evaluated:   {ngram_order}-gram")
     print(f"Total Evaluated Chunks:   {total_chunks:,}")
     print(f"Passed Chunks:            {passed_chunks_count:,}")
     print(f"Pass Percentage:          {pass_percentage:.2f}%")
     print("====================================================================")
 
-    # Resolve output directory base name (from user argument -o or auto-extracted from path)
     if output_base:
         project_folder = output_base.strip()
     else:
@@ -227,14 +232,12 @@ def evaluate_cosine(
             if len(path_parts) >= 3:
                 project_folder = path_parts[-3]
 
-    # Structure format: logs/{Synonym or Antonym}/{output_name}-{ngram}gram
     output_dir = os.path.join("logs", mode.capitalize(), f"{project_folder}-{ngram_order}gram")
     os.makedirs(output_dir, exist_ok=True)
     date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     file_prefix = f"{llm_name}_rel{relation_name}_{mode.lower()}_{date_str}_{ngram_order}gram"
 
-    # Export CSV
     csv_path = os.path.join(output_dir, f"{file_prefix}.csv")
     with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, quoting=csv.QUOTE_ALL)
@@ -243,7 +246,6 @@ def evaluate_cosine(
             writer.writerow([f"#{r['shot_id']}", r["status"], f"{r['cosine_similarity']:.4f}", r["source_chunk"], r["transformed_chunk"]])
     print(f"[Saved] CSV results saved to: '{csv_path}'")
 
-    # Export JSON
     json_path = os.path.join(output_dir, f"{file_prefix}.json")
     with open(json_path, mode="w", encoding="utf-8") as f:
         json.dump({
@@ -252,7 +254,7 @@ def evaluate_cosine(
             "task_name": task_name,
             "relation_name": relation_name,
             "evaluation_mode": mode,
-            "score_threshold": threshold,
+            "dynamic_threshold": round(dynamic_threshold, 4),
             "ngram_order": ngram_order,
             "total_chunks": total_chunks,
             "passed_chunks": passed_chunks_count,
@@ -261,7 +263,6 @@ def evaluate_cosine(
         }, f, ensure_ascii=False, indent=4)
     print(f"[Saved] JSON log saved to: '{json_path}'")
 
-    # Export TXT summary
     log_path = os.path.join(output_dir, f"{file_prefix}_summary.txt")
     summary_lines = [
         "=" * 60,
@@ -272,7 +273,7 @@ def evaluate_cosine(
         f"Task Name:                 {task_name}",
         f"Relation ID:               {relation_name}",
         f"Evaluation Mode:           {mode}",
-        f"Score Threshold:           {threshold}",
+        f"Avg Threshold:     {dynamic_threshold:.4f}",
         f"N-gram Order:              {ngram_order}",
         "-" * 60,
         f"Total Evaluated Chunks:    {total_chunks:,}",
