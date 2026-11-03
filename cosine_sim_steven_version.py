@@ -99,6 +99,7 @@ def evaluate_output_equivalence(
 
         # Define threshold rule based on the MR ID
         is_difference_mr = mr in DIFFERENCE_MRS
+        eval_rule_name = "Difference" if is_difference_mr else "Equivalence"
         threshold_str = "< 0.4" if is_difference_mr else ">= 0.8"
 
         records = []
@@ -139,7 +140,7 @@ def evaluate_output_equivalence(
             f"Model Evaluated:           {llm}",
             f"Task Name:                 {task}",
             f"Relation ID:               {mr}",
-            f"Evaluation Rule:           {'Difference' if is_difference_mr else 'Equivalence'}",
+            f"Evaluation Rule:           {eval_rule_name}",
             f"Equivalence Threshold:     {threshold_str}",
             f"Mean Cosine Similarity:    {mean_score:.4f}",
             "-" * 60,
@@ -167,10 +168,12 @@ def evaluate_output_equivalence(
                 if len(path_parts) >= 3:
                     project_folder = path_parts[-3]
 
-        output_dir = os.path.join("logs", "Equivalence", project_folder)
+        # Use the dynamic evaluation rule name for the folder structure
+        output_dir = os.path.join("logs", eval_rule_name, project_folder)
         os.makedirs(output_dir, exist_ok=True)
         
-        file_prefix = f"{llm}_rel{mr}_equiv_{date_str}"
+        # Adjust file prefix to reflect the rule correctly
+        file_prefix = f"{llm}_rel{mr}_{eval_rule_name.lower()}_{date_str}"
 
         # --- Save CSV ---
         csv_path = os.path.join(output_dir, f"{file_prefix}.csv")
@@ -189,7 +192,7 @@ def evaluate_output_equivalence(
                 "task_name": task,
                 "relation_name": mr,
                 "embedding_model": model_name,
-                "rule": "Difference" if is_difference_mr else "Equivalence",
+                "rule": eval_rule_name,
                 "score_threshold": threshold_str,
                 "mean_cosine_similarity": round(mean_score, 4),
                 "total_pairs": total_pairs,
