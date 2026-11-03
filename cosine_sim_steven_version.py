@@ -59,6 +59,8 @@ def evaluate_output_equivalence(
                     source_output = " ".join(source_output)
                 
                 followup_outputs = item.get("followup_outputs", [])
+                if followup_outputs is None:
+                     followup_outputs = []
                 
                 for f_idx, f_output in enumerate(followup_outputs):
                     if isinstance(f_output, list):
@@ -85,7 +87,7 @@ def evaluate_output_equivalence(
     # 4. Process and evaluate results group by group
     for (llm, task, mr), pairs in grouped_data.items():
         total_pairs = len(pairs)
-        print(f"\n[Run] Evaluating {llm} | Task: {task} | MR: {mr} ({total_pairs:,} pairs)")
+        print(f"\n[Run] Computing embeddings for {llm} | Task: {task} | MR: {mr}...")
 
         batch_src = [p["source_output"] for p in pairs]
         batch_fol = [p["followup_output"] for p in pairs]
@@ -126,12 +128,31 @@ def evaluate_output_equivalence(
 
         pass_percentage = (passed_count / total_pairs * 100.0)
         mean_score = sum(scores_list) / len(scores_list)
+        date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-        print(f"  - Mean Cosine Similarity: {mean_score:.4f}")
-        print(f"  - Threshold Rule:         {threshold_str}")
-        print(f"  - Passed:                 {passed_count:,} ({pass_percentage:.2f}%)")
+        # 5. Build the summary layout to be used for both Console Print and TXT Log
+        summary_lines = [
+            "=" * 60,
+            f"        LLMORPH OUTPUT EVALUATION SUMMARY",
+            "=" * 60,
+            f"Timestamp:                 {date_str}",
+            f"Model Evaluated:           {llm}",
+            f"Task Name:                 {task}",
+            f"Relation ID:               {mr}",
+            f"Evaluation Rule:           {'Difference' if is_difference_mr else 'Equivalence'}",
+            f"Equivalence Threshold:     {threshold_str}",
+            f"Mean Cosine Similarity:    {mean_score:.4f}",
+            "-" * 60,
+            f"Total Evaluated Pairs:     {total_pairs:,}",
+            f"Passed:                    {passed_count:,}",
+            f"Pass Percentage:           {pass_percentage:.2f}%",
+            "=" * 60,
+        ]
 
-        # 5. Save logs and outputs separated by group
+        # Print exactly like the text file
+        print("\n" + "\n".join(summary_lines))
+
+        # 6. Save logs and outputs separated by group
         if output_base:
             project_folder = output_base.strip()
         else:
@@ -139,18 +160,17 @@ def evaluate_output_equivalence(
             path_parts = abs_path.split(os.sep)
             project_folder = "llm-nlpaug"
             for part in path_parts:
-                if any(k in part for k in ["nlpaug", "transform", "dataset", "results"]):
+                if "nlpaug" in part or "transform" in part or "dataset" in part or "results" in part:
                     project_folder = part
                     break
             else:
                 if len(path_parts) >= 3:
                     project_folder = path_parts[-3]
 
-        output_dir = os.path.join("logs", "Equivalence", project_folder, llm)
+        output_dir = os.path.join("logs", "Equivalence", project_folder)
         os.makedirs(output_dir, exist_ok=True)
         
-        date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        file_prefix = f"rel{mr}_{task}_{date_str}"
+        file_prefix = f"{llm}_rel{mr}_equiv_{date_str}"
 
         # --- Save CSV ---
         csv_path = os.path.join(output_dir, f"{file_prefix}.csv")
@@ -180,23 +200,6 @@ def evaluate_output_equivalence(
 
         # --- Save TXT Summary ---
         log_path = os.path.join(output_dir, f"{file_prefix}_summary.txt")
-        summary_lines = [
-            "=" * 60,
-            f"        LLMORPH OUTPUT EVALUATION SUMMARY",
-            "=" * 60,
-            f"Timestamp:                 {date_str}",
-            f"Model Evaluated:           {llm}",
-            f"Task Name:                 {task}",
-            f"Relation ID:               {mr}",
-            f"Evaluation Rule:           {'Difference' if is_difference_mr else 'Equivalence'}",
-            f"Equivalence Threshold:     {threshold_str}",
-            f"Mean Cosine Similarity:    {mean_score:.4f}",
-            "-" * 60,
-            f"Total Evaluated Pairs:     {total_pairs:,}",
-            f"Passed:                    {passed_count:,}",
-            f"Pass Percentage:           {pass_percentage:.2f}%",
-            "=" * 60,
-        ]
         with open(log_path, mode="w", encoding="utf-8") as f:
             f.write("\n".join(summary_lines) + "\n")
 
