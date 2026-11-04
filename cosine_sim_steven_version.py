@@ -9,14 +9,13 @@ from collections import defaultdict
 import torch
 from sentence_transformers import SentenceTransformer, util
 
-# Define the list of MRs that expect a "Difference" output, based on the LLMORPH paper
+# Define the list of MRs that expect a "Difference" input, based on the LLMORPH paper
 DIFFERENCE_MRS = {"10", "34", "137", "142", "152"}
 
-def evaluate_output_equivalence(
+def evaluate_input_equivalence(
     path: str,
     output_base: str = None,
-    model_name: str = "paraphrase-MiniLM-L6-v2",
-    batch_size: int = 64,
+    model_name: str = "paraphrase-MiniLM-L6-v2", # Can be changed to "all-mpnet-base-v2" when calling
 ) -> None:
     # 1. Search for JSON files
     json_files = []
@@ -54,32 +53,32 @@ def evaluate_output_equivalence(
             for item_idx, item in enumerate(data_entries):
                 shot_id = item.get("id", item_idx)
                 
-                source_output = item.get("source_output", "")
-                if isinstance(source_output, list):
-                    source_output = " ".join(source_output)
+                # Extract source input data
+                source_input = item.get("source_input", "")
+                if isinstance(source_input, list):
+                    source_input = " ".join(source_input)
                 
-                followup_outputs = item.get("followup_outputs", [])
-                if followup_outputs is None:
-                     followup_outputs = []
+                # Extract follow-up input data and handle null (None) values
+                followup_inputs = item.get("followup_inputs") or []
                 
-                for f_idx, f_output in enumerate(followup_outputs):
-                    if isinstance(f_output, list):
-                        f_output = " ".join(f_output)
+                for f_idx, f_input in enumerate(followup_inputs):
+                    if isinstance(f_input, list):
+                        f_input = " ".join(f_input)
                     
-                    if not source_output.strip() or not f_output.strip():
+                    if not source_input.strip() or not f_input.strip():
                         continue
 
                     grouped_data[group_key].append({
                         "shot_id": shot_id,
-                        "source_output": source_output,
-                        "followup_output": f_output
+                        "source_input": source_input,
+                        "followup_input": f_input
                     })
 
     if not grouped_data:
-        print("[Error] No valid output pairs found for evaluation.")
+        print("[Error] No valid input pairs found for evaluation.")
         return
 
-    # 3. Load the SentenceTransformer model (loaded once, applied to all groups)
+    # 3. Load the SentenceTransformer model
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[Init] Loading SentenceTransformer ({model_name}) on {device}...")
     model = SentenceTransformer(model_name, device=device)
@@ -87,17 +86,8 @@ def evaluate_output_equivalence(
     # 4. Process and evaluate results group by group
     for (llm, task, mr), pairs in grouped_data.items():
         total_pairs = len(pairs)
-        print(f"\n[Run] Computing embeddings for {llm} | Task: {task} | MR: {mr}...")
+        print(f"\n[Run] Computing embeddings pairwise for {llm} | Task: {task} | MR: {mr}...")
 
-        batch_src = [p["source_output"] for p in pairs]
-        batch_fol = [p["followup_output"] for p in pairs]
-        
-        emb_src = model.encode(batch_src, batch_size=batch_size, convert_to_tensor=True, show_progress_bar=False)
-        emb_fol = model.encode(batch_fol, batch_size=batch_size, convert_to_tensor=True, show_progress_bar=False)
-        
-        raw_scores = util.cos_sim(emb_src, emb_fol).diagonal().cpu().tolist()
-
-        # Define threshold rule based on the MR ID
         is_difference_mr = mr in DIFFERENCE_MRS
         eval_rule_name = "Difference" if is_difference_mr else "Equivalence"
         threshold_str = "< 0.4" if is_difference_mr else ">= 0.8"
@@ -106,11 +96,14 @@ def evaluate_output_equivalence(
         passed_count = 0
         scores_list = []
 
-        for pair, score in zip(pairs, raw_scores):
-            cosine_score = float(score)
+        # Process and compute scores pairwise
+        for pair in pairs:
+            embeddings = model.encode([pair["source_input"], pair["followup_input"]], convert_to_tensor=True, show_progress_bar=False)
+            cosine_sim = util.pytorch_cos_sim(embeddings[0], embeddings[1])
+            cosine_score = float(cosine_sim)
+            
             scores_list.append(cosine_score)
             
-            # Check pass/fail status based on the LLMORPH paper's criteria
             if is_difference_mr:
                 is_pass = cosine_score < 0.4
             else:
@@ -123,18 +116,18 @@ def evaluate_output_equivalence(
                 "shot_id": pair["shot_id"],
                 "status": "PASS" if is_pass else "FAIL",
                 "cosine_similarity": round(cosine_score, 4),
-                "source_output": pair["source_output"],
-                "followup_output": pair["followup_output"]
+                "source_input": pair["source_input"],
+                "followup_input": pair["followup_input"]
             })
 
         pass_percentage = (passed_count / total_pairs * 100.0)
         mean_score = sum(scores_list) / len(scores_list)
         date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-        # 5. Build the summary layout to be used for both Console Print and TXT Log
+        # 5. Build the summary layout
         summary_lines = [
             "=" * 60,
-            f"        LLMORPH OUTPUT EVALUATION SUMMARY",
+            f"        LLMORPH INPUT TRANSFORMATION EVALUATION SUMMARY",
             "=" * 60,
             f"Timestamp:                 {date_str}",
             f"Model Evaluated:           {llm}",
@@ -150,7 +143,6 @@ def evaluate_output_equivalence(
             "=" * 60,
         ]
 
-        # Print exactly like the text file
         print("\n" + "\n".join(summary_lines))
 
         # 6. Save logs and outputs separated by group
@@ -168,20 +160,18 @@ def evaluate_output_equivalence(
                 if len(path_parts) >= 3:
                     project_folder = path_parts[-3]
 
-        # Use the dynamic evaluation rule name for the folder structure
-        output_dir = os.path.join("logs", eval_rule_name, project_folder)
+        output_dir = os.path.join("logs", f"Input_{eval_rule_name}", project_folder)
         os.makedirs(output_dir, exist_ok=True)
         
-        # Adjust file prefix to reflect the rule correctly
-        file_prefix = f"{llm}_rel{mr}_{eval_rule_name.lower()}_{date_str}"
+        file_prefix = f"{llm}_rel{mr}_input_{eval_rule_name.lower()}_{date_str}"
 
         # --- Save CSV ---
         csv_path = os.path.join(output_dir, f"{file_prefix}.csv")
         with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f, quoting=csv.QUOTE_ALL)
-            writer.writerow(["Shot_ID", "Status", "Cosine_Similarity", "Source_Output", "Followup_Output"])
+            writer.writerow(["Shot_ID", "Status", "Cosine_Similarity", "Source_Input", "Followup_Input"])
             for r in records:
-                writer.writerow([f"#{r['shot_id']}", r["status"], f"{r['cosine_similarity']:.4f}", r["source_output"], r["followup_output"]])
+                writer.writerow([f"#{r['shot_id']}", r["status"], f"{r['cosine_similarity']:.4f}", r["source_input"], r["followup_input"]])
 
         # --- Save JSON ---
         json_path = os.path.join(output_dir, f"{file_prefix}.json")
@@ -207,18 +197,16 @@ def evaluate_output_equivalence(
             f.write("\n".join(summary_lines) + "\n")
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluation script for LLM output equivalence/difference using cosine similarity.")
+    parser = argparse.ArgumentParser(description="Evaluation script for LLM INPUT transformation equivalence/difference using cosine similarity.")
     parser.add_argument("-p", "--path", type=str, required=True, help="Path to evaluated test result JSON file OR directory containing JSON files.")
     parser.add_argument("-o", "--output", type=str, default=None, help="Custom output folder base name.")
     parser.add_argument("-m", "--model", type=str, default="paraphrase-MiniLM-L6-v2", help="Sentence Transformer model name.")
-    parser.add_argument("-b", "--batch_size", type=int, default=64, help="Batch size for faster inference.")
     return parser.parse_args()
 
 if __name__ == "__main__":
     args = parse_arguments()
-    evaluate_output_equivalence(
+    evaluate_input_equivalence(
         path=args.path,
         output_base=args.output,
         model_name=args.model,
-        batch_size=args.batch_size,
     )
