@@ -58,8 +58,7 @@ def evaluate_input_equivalence(
                 if isinstance(source_input, list):
                     source_input = " ".join(source_input)
                 
-                # Extract follow-up input data and handle null (None) values
-                followup_inputs = item.get("followup_inputs") or []
+                followup_inputs = item.get("followup_inputs", [])
                 
                 for f_idx, f_input in enumerate(followup_inputs):
                     if isinstance(f_input, list):
@@ -90,10 +89,8 @@ def evaluate_input_equivalence(
 
         is_difference_mr = mr in DIFFERENCE_MRS
         eval_rule_name = "Difference" if is_difference_mr else "Equivalence"
-        threshold_str = "< 0.4" if is_difference_mr else ">= 0.8"
 
         records = []
-        passed_count = 0
         scores_list = []
 
         # Process and compute scores pairwise
@@ -104,24 +101,14 @@ def evaluate_input_equivalence(
             
             scores_list.append(cosine_score)
             
-            if is_difference_mr:
-                is_pass = cosine_score < 0.4
-            else:
-                is_pass = cosine_score >= 0.8
-                
-            if is_pass:
-                passed_count += 1
-                
             records.append({
                 "shot_id": pair["shot_id"],
-                "status": "PASS" if is_pass else "FAIL",
                 "cosine_similarity": round(cosine_score, 4),
                 "source_input": pair["source_input"],
                 "followup_input": pair["followup_input"]
             })
 
-        pass_percentage = (passed_count / total_pairs * 100.0)
-        mean_score = sum(scores_list) / len(scores_list)
+        mean_score = sum(scores_list) / len(scores_list) if scores_list else 0.0
         date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
         # 5. Build the summary layout
@@ -134,12 +121,9 @@ def evaluate_input_equivalence(
             f"Task Name:                 {task}",
             f"Relation ID:               {mr}",
             f"Evaluation Rule:           {eval_rule_name}",
-            f"Equivalence Threshold:     {threshold_str}",
             f"Mean Cosine Similarity:    {mean_score:.4f}",
             "-" * 60,
             f"Total Evaluated Pairs:     {total_pairs:,}",
-            f"Passed:                    {passed_count:,}",
-            f"Pass Percentage:           {pass_percentage:.2f}%",
             "=" * 60,
         ]
 
@@ -160,7 +144,8 @@ def evaluate_input_equivalence(
                 if len(path_parts) >= 3:
                     project_folder = path_parts[-3]
 
-        output_dir = os.path.join("logs", f"Input_{eval_rule_name}", project_folder)
+        # Structure: logs/Difference/10/project_folder
+        output_dir = os.path.join("logs", eval_rule_name, str(mr), project_folder)
         os.makedirs(output_dir, exist_ok=True)
         
         file_prefix = f"{llm}_rel{mr}_input_{eval_rule_name.lower()}_{date_str}"
@@ -169,9 +154,9 @@ def evaluate_input_equivalence(
         csv_path = os.path.join(output_dir, f"{file_prefix}.csv")
         with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f, quoting=csv.QUOTE_ALL)
-            writer.writerow(["Shot_ID", "Status", "Cosine_Similarity", "Source_Input", "Followup_Input"])
+            writer.writerow(["Shot_ID", "Cosine_Similarity", "Source_Input", "Followup_Input"])
             for r in records:
-                writer.writerow([f"#{r['shot_id']}", r["status"], f"{r['cosine_similarity']:.4f}", r["source_input"], r["followup_input"]])
+                writer.writerow([f"#{r['shot_id']}", f"{r['cosine_similarity']:.4f}", r["source_input"], r["followup_input"]])
 
         # --- Save JSON ---
         json_path = os.path.join(output_dir, f"{file_prefix}.json")
@@ -183,11 +168,8 @@ def evaluate_input_equivalence(
                 "relation_name": mr,
                 "embedding_model": model_name,
                 "rule": eval_rule_name,
-                "score_threshold": threshold_str,
                 "mean_cosine_similarity": round(mean_score, 4),
                 "total_pairs": total_pairs,
-                "passed_pairs": passed_count,
-                "pass_percentage": round(pass_percentage, 2),
                 "records": records
             }, f, ensure_ascii=False, indent=4)
 
