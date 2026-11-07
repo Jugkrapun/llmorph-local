@@ -15,7 +15,8 @@ DIFFERENCE_MRS = {"10", "34", "137", "142", "152"}
 def evaluate_input_equivalence(
     path: str,
     output_base: str = None,
-    model_name: str = "paraphrase-MiniLM-L6-v2", # Can be changed to "all-mpnet-base-v2" when calling
+    model_name: str = "all-mpnet-base-v2", # Can be changed to "paraphrase-MiniLM-L6-v2" when calling
+
 ) -> None:
     # 1. Search for JSON files
     json_files = []
@@ -44,11 +45,10 @@ def evaluate_input_equivalence(
             if not data_entries:
                 continue
             
-            llm_name = json_obj.get("llm_name", "unknown_model")
             task_name = json_obj.get("task_name", "unknown_task")
             relation_name = str(json_obj.get("relation_name", "N/A"))
             
-            group_key = (llm_name, task_name, relation_name)
+            group_key = (task_name, relation_name)
 
             for item_idx, item in enumerate(data_entries):
                 shot_id = item.get("id", item_idx)
@@ -83,9 +83,9 @@ def evaluate_input_equivalence(
     model = SentenceTransformer(model_name, device=device)
 
     # 4. Process and evaluate results group by group
-    for (llm, task, mr), pairs in grouped_data.items():
+    for (task, mr), pairs in grouped_data.items():
         total_pairs = len(pairs)
-        print(f"\n[Run] Computing embeddings pairwise for {llm} | Task: {task} | MR: {mr}...")
+        print(f"\n[Run] Task: {task} | MR: {mr}...")
 
         is_difference_mr = mr in DIFFERENCE_MRS
         eval_rule_name = "Difference" if is_difference_mr else "Equivalence"
@@ -117,7 +117,6 @@ def evaluate_input_equivalence(
             f"        LLMORPH INPUT TRANSFORMATION EVALUATION SUMMARY",
             "=" * 60,
             f"Timestamp:                 {date_str}",
-            f"Model Evaluated:           {llm}",
             f"Task Name:                 {task}",
             f"Relation ID:               {mr}",
             f"Evaluation Rule:           {eval_rule_name}",
@@ -130,25 +129,13 @@ def evaluate_input_equivalence(
         print("\n" + "\n".join(summary_lines))
 
         # 6. Save logs and outputs separated by group
-        if output_base:
-            project_folder = output_base.strip()
-        else:
-            abs_path = os.path.abspath(path)
-            path_parts = abs_path.split(os.sep)
-            project_folder = "llm-nlpaug"
-            for part in path_parts:
-                if "nlpaug" in part or "transform" in part or "dataset" in part or "results" in part:
-                    project_folder = part
-                    break
-            else:
-                if len(path_parts) >= 3:
-                    project_folder = path_parts[-3]
+        project_folder = output_base.strip()
 
         # Structure: logs/Difference/10/project_folder
         output_dir = os.path.join("logs", eval_rule_name, str(mr), project_folder)
         os.makedirs(output_dir, exist_ok=True)
         
-        file_prefix = f"{llm}_rel{mr}_input_{eval_rule_name.lower()}_{date_str}"
+        file_prefix = f"{mr}_input_{eval_rule_name.lower()}_{date_str}"
 
         # --- Save CSV ---
         csv_path = os.path.join(output_dir, f"{file_prefix}.csv")
@@ -163,7 +150,6 @@ def evaluate_input_equivalence(
         with open(json_path, mode="w", encoding="utf-8") as f:
             json.dump({
                 "timestamp": date_str,
-                "model_evaluated": llm,
                 "task_name": task,
                 "relation_name": mr,
                 "embedding_model": model_name,
@@ -182,7 +168,7 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluation script for LLM INPUT transformation equivalence/difference using cosine similarity.")
     parser.add_argument("-p", "--path", type=str, required=True, help="Path to evaluated test result JSON file OR directory containing JSON files.")
     parser.add_argument("-o", "--output", type=str, default=None, help="Custom output folder base name.")
-    parser.add_argument("-m", "--model", type=str, default="paraphrase-MiniLM-L6-v2", help="Sentence Transformer model name.")
+    parser.add_argument("-m", "--model", type=str, default="all-mpnet-base-v2", help="Sentence Transformer model name.")
     return parser.parse_args()
 
 if __name__ == "__main__":
