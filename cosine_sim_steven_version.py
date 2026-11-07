@@ -241,15 +241,23 @@ def _process_and_save_groups(
         is_difference_mr = mr in DIFFERENCE_MRS
         eval_rule_name = "Difference" if is_difference_mr else "Equivalence"
 
+        # Combine inputs to compute embeddings in bulk, avoiding NxN matrix memory issues
+        combined_texts = []
+        for p in pairs:
+            combined_texts.append(p["source_chunk"])
+            combined_texts.append(p["followup_chunk"])
+        
+        all_embeddings = embedding.encode(combined_texts, batch_size=batch_size, convert_to_tensor=True, show_progress_bar=False)
+        
+        # Split source and followup embeddings
+        emb_src = all_embeddings[0::2]
+        emb_fol = all_embeddings[1::2]
+        
+        # Compute element-wise cosine similarity
+        raw_scores = torch.nn.functional.cosine_similarity(emb_src, emb_fol).cpu().tolist()
+
         records = []
         scores_list = []
-
-        batch_src = [p["source_chunk"] for p in pairs]
-        batch_fol = [p["followup_chunk"] for p in pairs]
-        
-        emb_src = embedding.encode(batch_src, batch_size=batch_size, convert_to_tensor=True, show_progress_bar=False)
-        emb_fol = embedding.encode(batch_fol, batch_size=batch_size, convert_to_tensor=True, show_progress_bar=False)
-        raw_scores = util.cos_sim(emb_src, emb_fol).diagonal().cpu().tolist()
 
         for pair, score in zip(pairs, raw_scores):
             cosine_score = float(score)
