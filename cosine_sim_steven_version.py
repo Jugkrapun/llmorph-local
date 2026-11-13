@@ -18,6 +18,9 @@ DIFFERENCE_MRS = {"10", "34", "137", "142", "152"}
 # Define the list of MRs that expect an "Equivalence" input, based on the experiment table
 EQUIVALENCE_MRS = {"8", "25", "51", "127", "136", "149", "155"}
 
+# --- THRESHOLD ---
+THRESHOLD = 0.6
+
 def tokenize(text: str) -> List[str]:
     """Tokenizes input text into a list of words using regular expressions."""
     return re.findall(r"\w+", text)
@@ -258,19 +261,33 @@ def _process_and_save_groups(
 
         records = []
         scores_list = []
+        passed_count = 0 # Initialize counter for pass percentage
 
         for pair, score in zip(pairs, raw_scores):
             cosine_score = float(score)
             scores_list.append(cosine_score)
 
+            # Evaluate Pass/Fail based on MR type and single Threshold
+            if is_difference_mr:
+                is_passed = cosine_score < THRESHOLD
+            else:
+                is_passed = cosine_score >= THRESHOLD
+
+            if is_passed:
+                passed_count += 1
+
             records.append({
                 "shot_id": pair["shot_id"],
                 "cosine_similarity": round(cosine_score, 4),
+                "is_passed": is_passed,
                 "source_text": pair["source_chunk"],
                 "followup_text": pair["followup_chunk"]
             })
 
+        # Calculate Mean and Pass Percentage
         mean_score = sum(scores_list) / len(scores_list) if scores_list else 0.0
+        pass_percentage = (passed_count / total_pairs) * 100 if total_pairs > 0 else 0.0
+        
         date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
         summary_lines = [
@@ -282,7 +299,9 @@ def _process_and_save_groups(
             f"Relation ID:               {mr}",
             f"Evaluation Rule:           {eval_rule_name}",
             f"Evaluation Level:          {level_label.upper()}",
+            f"Threshold Used:            {THRESHOLD}",
             f"Mean Cosine Similarity:    {mean_score:.4f}",
+            f"Pass Percentage:           {pass_percentage:.2f}% ({passed_count}/{total_pairs})",
             "-" * 60,
             f"Total Evaluated Items:     {total_pairs:,}",
             "=" * 60,
@@ -313,9 +332,10 @@ def _process_and_save_groups(
         csv_path = os.path.join(output_dir, f"{file_prefix}.csv")
         with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f, quoting=csv.QUOTE_ALL)
-            writer.writerow(["Shot_ID", "Cosine_Similarity", "Source_Text", "Followup_Text"])
+            # Added "Passed" column
+            writer.writerow(["Shot_ID", "Cosine_Similarity", "Passed", "Source_Text", "Followup_Text"])
             for r in records:
-                writer.writerow([f"#{r['shot_id']}", f"{r['cosine_similarity']:.4f}", r["source_text"], r["followup_text"]])
+                writer.writerow([f"#{r['shot_id']}", f"{r['cosine_similarity']:.4f}", str(r['is_passed']), r["source_text"], r["followup_text"]])
 
         # --- Save JSON ---
         json_path = os.path.join(output_dir, f"{file_prefix}.json")
@@ -327,7 +347,10 @@ def _process_and_save_groups(
                 "embedding_name": embedding_name,
                 "rule": eval_rule_name,
                 "evaluation_level": level_label,
+                "threshold_used": THRESHOLD,
                 "mean_cosine_similarity": round(mean_score, 4),
+                "pass_percentage": round(pass_percentage, 2),
+                "total_passed": passed_count,
                 "total_items": total_pairs,
                 "records": records
             }, f, ensure_ascii=False, indent=4)
